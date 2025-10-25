@@ -23,6 +23,11 @@ extern "C" {
 #endif
 #define LED_PIN PIN_015
 
+#ifndef PIN_022
+#define PIN_022 (22)     // teraz: SWITCH (client) / LED (server)
+#endif
+#define IO_PIN_022 PIN_022
+
 #define USB_LOG   Serial
 #define UART_DOCK Serial1
 #define UART_BAUD 115200
@@ -296,6 +301,18 @@ uint16_t g_conn = BLE_CONN_HANDLE_INVALID;
 static uint32_t g_active_id = 0;
 static uint8_t  g_active_mac[6] = {0};
 
+// ===== SWITCH (CLIENT) — ISR =====
+volatile bool     g_sw_irq_flag = false;
+volatile uint32_t g_sw_count    = 0;
+volatile uint32_t g_sw_last_us  = 0;  // debounce w ISR (micros)
+static void sw_isr() {
+  uint32_t now = micros();
+  if (now - g_sw_last_us < 150000U) return; // ~150 ms debounce
+  g_sw_last_us = now;
+  g_sw_irq_flag = true;
+  g_sw_count++;
+}
+
 // ===== SERVER CALLBACKS =====
 void server_connect_cb(uint16_t conn_handle) {
   g_conn = conn_handle;
@@ -387,7 +404,7 @@ void server_scan_cb(ble_gap_evt_adv_report_t* report){
   }
 }
 
-// ===== SERVER UART HANDLER (HELLO/ASSIGN/ACK z ochroną ID) =====
+// ===== SERVER UART HELPERY (HELLO/ASSIGN/ACK z ochroną ID) =====
 void server_pollDock_andAssign() {
   enum { WAIT_HELLO, SENT_ASSIGN } static state = WAIT_HELLO;
   static uint32_t lastWHO = 0, assigned = 0, tAssign = 0;
@@ -453,7 +470,25 @@ void server_bridgeUsbBle(){
   }
   if (g_conn!=BLE_CONN_HANDLE_INVALID && clientUart.available()){
     String s = clientUart.readStringUntil('\n');
-    LOGF("[BLE] %s", s.c_str());
+
+    // Komunikat od klienta: "SW <licznik>" -> przełącz LED na serwerze
+    if (s.startsWith("SW ")) {
+      int state = digitalRead(IO_PIN_022);
+      digitalWrite(IO_PIN_022, !state); // TOGGLE LED
+      LOGF("[SERVER] got SWITCH evt from client -> LED on PIN_022 = %s",
+           (!state) ? "ON" : "OFF");
+
+      if (g_oled_ok) {
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, (OLED_H >= 64) ? 40 : 24);
+        display.print("LED: ");
+        display.println((!state) ? "ON" : "OFF");
+        oledSafeDisplay();
+      }
+    } else {
+      LOGF("[BLE] %s", s.c_str());
+    }
   }
 }
 
@@ -462,6 +497,10 @@ void run_server(){
   Bluefruit.begin(0,1);
   Bluefruit.setTxPower(4);
   clientUart.begin();
+
+  // ===== LED na PIN_022 (serwer) =====
+  pinMode(IO_PIN_022, OUTPUT);
+  digitalWrite(IO_PIN_022, LOW);           // LED OFF
 
   // wczytaj bazę ID, deduplikuj i ustaw startowy kandydat
   iddb_load();
@@ -601,6 +640,10 @@ void run_client_idle_or_ble(){
   if (!cfg_load()){ g_cfg.magic=CFG_MAGIC; g_cfg.client_id=0; cfg_save(); }
   Bluefruit.begin(); Bluefruit.setTxPower(4); bleuart.begin();
 
+  // SWITCH na PIN_022 (klient) – przycisk do GND
+  pinMode(IO_PIN_022, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(IO_PIN_022), sw_isr, FALLING);
+
   if (g_cfg.client_id==0){
     LOGF("[BOOT] role=CLIENT_IDLE (no ID)");
     if (g_oled_ok) oledShowClientIdle(millis()/1000);
@@ -640,13 +683,45 @@ void run_client_idle_or_ble(){
         oledShowClientBLE(g_cfg.client_id, isConn, millis()/1000);
       }
     }
+
+    // Gdy połączenie BLE zestawione – obsługa I/O
     if (Bluefruit.connected()){
       digitalWrite(LED_PIN,HIGH);
+
+      // Odbiór innych wiadomości (echo)
       while (bleuart.available()){
         String msg = bleuart.readStringUntil('\n');
+        // brak reakcji na "SW ..." — teraz tylko serwer reaguje
         bleuart.printf("CLIENT %lu: %s\n", g_cfg.client_id, msg.c_str());
       }
     }
+
+    // --- NOWE: obsługa przycisku po stronie klienta ---
+    if (g_sw_irq_flag) {
+      noInterrupts();
+      g_sw_irq_flag = false;
+      uint32_t cnt = g_sw_count;
+      interrupts();
+
+      if (Bluefruit.connected()) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "SW %lu\n", (unsigned long)cnt);
+        bleuart.write((const uint8_t*)buf, strlen(buf));
+        LOGF("[CLIENT] sent SWITCH #%lu to server", (unsigned long)cnt);
+
+        if (g_oled_ok) {
+          display.setTextSize(1);
+          display.setTextColor(SSD1306_WHITE);
+          display.setCursor(0, (OLED_H >= 64) ? 40 : 24);
+          display.print("BTN cnt: ");
+          display.println((unsigned long)cnt);
+          oledSafeDisplay();
+        }
+      } else {
+        LOGF("[CLIENT] switch press, but not connected – skipped");
+      }
+    }
+
     // ewentualny reassign przez dock
     if (UART_DOCK.available()){
       String l = readLine(UART_DOCK,5);
@@ -679,6 +754,8 @@ void setup(){
     display.println("Display OK");
     oledSafeDisplay();
   }
+
+  LOGF("[IO] PIN_022 configured: server=LED (OUTPUT), client=SWITCH (INPUT_PULLUP)");
 
   uint32_t t0=millis();
   while(!usb_mounted() && millis()-t0<6000){
