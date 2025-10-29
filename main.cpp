@@ -28,6 +28,12 @@ extern "C" {
 #endif
 #define IO_PIN_022 PIN_022
 
+// — Przycisk listy na PIN_024 —
+#ifndef PIN_024
+#define PIN_024 (24)             // przycisk trybu listy (serwer) / KEY A (klient)
+#endif
+#define BTN_LIST_PIN PIN_024
+
 #define USB_LOG   Serial
 #define UART_DOCK Serial1
 #define UART_BAUD 115200
@@ -51,6 +57,9 @@ extern "C" {
 Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, -1);
 static bool g_oled_ok = false;
 
+// —— Tryb listy klientów (serwer) ——
+static bool g_oled_show_list = false;
+
 static inline void oledSafeDisplay() { if (g_oled_ok) display.display(); }
 
 static void oledBoot(const char* msg) {
@@ -64,17 +73,21 @@ static void oledBoot(const char* msg) {
   oledSafeDisplay();
 }
 
-static void oledShowServer(const char* bleState,
-                           const char* activeStr,
-                           uint32_t uptime_s) {
+// —— Ekran główny SERWERA (bez ID/MAC) — BLE + up + liczba połączeń ——
+static void oledShowServer(const char* bleState, uint8_t conn_count, uint32_t uptime_s) {
   if (!g_oled_ok) return;
   display.clearDisplay();
-  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
   display.setCursor(0,0);
   display.println("SERVER");
-  display.print("BLE: "); display.println(bleState);
-  if (activeStr && activeStr[0]) display.println(activeStr);
-  display.print("up: "); display.print(uptime_s); display.println("s");
+  display.print("BLE: ");
+  display.print(bleState);
+  display.print(" ");
+  display.println(conn_count);
+  display.print("up: ");
+  display.print(uptime_s);
+  display.println("s");
   oledSafeDisplay();
 }
 
@@ -124,7 +137,6 @@ static inline String readLine(Stream& s, uint32_t to_ms=500){
       if(c=='\n') return line;
       if(c!='\r') line+=c;
     }
-    // bez delay – pętla jest krótka i z timeoutem
     yield();
   }
   return "";
@@ -276,7 +288,7 @@ static uint32_t id_next_free(uint32_t start_from=1) {
   return cand;
 }
 
-// 🔹 formatter inline dla „clients: ID=.. MAC=.., ...”
+// 🔹 formatter inline do logów „clients: ID=.. MAC=.., ...”
 static void format_clients_inline(char* out, size_t outlen) {
   if (!out || outlen == 0) return;
   out[0] = 0;
@@ -294,6 +306,81 @@ static void format_clients_inline(char* out, size_t outlen) {
     used += (size_t)n;
     if (used >= outlen) { out[outlen-1]=0; break; }
   }
+}
+
+// ====== OLED: lista klientów (ID + MAC, bez '=') ======
+static void oledShowClientsList() {
+  if (!g_oled_ok) return;
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("CLIENTS");
+
+  // 8 px / wiersz
+  uint8_t maxRows = OLED_H / 8;
+  if (maxRows == 0) maxRows = 1;
+  uint8_t rowsAvail = (maxRows > 1) ? (maxRows - 1) : 0;
+
+  uint8_t shown = 0;
+  for (uint32_t i = 0; i < g_ids_count && shown < rowsAvail; ++i) {
+    char macStr[18];
+    sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X",
+            g_ids[i].mac[5], g_ids[i].mac[4], g_ids[i].mac[3],
+            g_ids[i].mac[2], g_ids[i].mac[1], g_ids[i].mac[0]);
+
+    // Bez '=': "ID<nr>  <MAC>"
+    display.print("ID");
+    display.print((unsigned long)g_ids[i].id);
+    display.print("  ");
+    display.println(macStr);
+    shown++;
+  }
+
+  if (g_ids_count > shown) {
+    display.print("... total=");
+    display.println((unsigned long)g_ids_count);
+  }
+
+  oledSafeDisplay();
+}
+
+// ================== USB HID KEYBOARD (SERWER) ==================
+// używamy makra BEZ argumentów
+uint8_t const desc_hid_report[] = { TUD_HID_REPORT_DESC_KEYBOARD() };
+
+Adafruit_USBD_HID usb_hid(desc_hid_report, sizeof(desc_hid_report),
+                          HID_ITF_PROTOCOL_KEYBOARD, 10, false);
+
+// --- HID tap queue (server) ---
+static volatile bool g_hid_a_pending = false;
+static uint32_t g_hid_last_tap_ms = 0;
+
+// bezpieczny „tap” klawisza
+static inline void hid_tap_key(uint8_t key, uint16_t down_ms = 15, uint16_t post_ms = 2) {
+  if (!TinyUSBDevice.mounted()) return;
+
+  if (TinyUSBDevice.suspended()) {
+    TinyUSBDevice.remoteWakeup();
+    delay(5);
+  }
+
+  uint32_t t0 = millis();
+  while (!usb_hid.ready() && (millis() - t0) < 50) { yield(); }
+
+  uint8_t keys[6] = { key, 0,0,0,0,0 };
+  usb_hid.keyboardReport(0, 0, keys);   // PRESS
+  delay(down_ms);                       // >= 1 okresu pollingu (10 ms)
+
+  uint8_t empty[6] = {0};
+  usb_hid.keyboardReport(0, 0, empty);  // RELEASE
+  delay(post_ms);
+}
+
+// dedykowane 'a'
+static inline void hid_send_key_a_safe() {
+  hid_tap_key(HID_KEY_A, 15, 2);
 }
 
 // ================== BLE ==================
@@ -315,14 +402,33 @@ static void sw_isr() {
   g_sw_count++;
 }
 
+// ===== Przycisk listy (SERVER) — ISR =====
+volatile bool     g_btn024_irq     = false;
+volatile uint32_t g_btn024_last_us = 0;
+static void btn024_isr() {
+  uint32_t now = micros();
+  if (now - g_btn024_last_us < 150000U) return; // ~150 ms debounce
+  g_btn024_last_us = now;
+  g_btn024_irq = true;
+}
+
+// ===== KLIENT: przycisk na PIN_024 → wysyłka KEY A — ISR =====
+volatile bool     g_btn024_cli_irq     = false;
+volatile uint32_t g_btn024_cli_last_us = 0;
+static void btn024_client_isr() {
+  uint32_t now = micros();
+  if (now - g_btn024_cli_last_us < 200000U) return; // 200 ms debounce (stabilniej)
+  g_btn024_cli_last_us = now;
+  g_btn024_cli_irq = true;
+}
+
 // ===== SERVER CALLBACKS =====
 void server_connect_cb(uint16_t conn_handle) {
   g_conn = conn_handle;
-  ledBlink(2,60,80); // rzadkie, dopuszczalne
+  ledBlink(2,60,80); // rzadkie
 
-  // 3 próby discover – klient może dopiero stawiać usługę
   bool ok = false;
-  for (int i=0; i<3 && !ok; ++i) { ok = clientUart.discover(conn_handle); if (!ok) delay(150); } // sporadyczne
+  for (int i=0; i<3 && !ok; ++i) { ok = clientUart.discover(conn_handle); if (!ok) delay(150); }
   if (!ok) {
     LOGF("[SERVER] BLE discovery failed (3x), disconnecting");
     Bluefruit.disconnect(conn_handle);
@@ -353,10 +459,8 @@ void server_connect_cb(uint16_t conn_handle) {
   else
     LOGF("[SERVER] CONNECTED → ID=%d MAC=%s RSSI=%d dBm", id, macStr, rssi_meas);
 
-  if (g_oled_ok) {
-    char active[40];
-    snprintf(active, sizeof(active), "ID=%lu %s", (unsigned long)g_active_id, macStr);
-    oledShowServer("connected", active, millis()/1000);
+  if (g_oled_ok && !g_oled_show_list) {
+    oledShowServer("connected", 1, millis()/1000);
   }
 }
 
@@ -371,10 +475,10 @@ void server_disconnect_cb(uint16_t, uint8_t reason) {
 
   memset(g_active_mac,0,sizeof(g_active_mac));
   g_active_id = 0;
-  ledBlink(1,200,200); // sporadyczne
+  ledBlink(1,200,200); // rzadkie
 
-  if (g_oled_ok) {
-    oledShowServer("scanning", "", millis()/1000);
+  if (g_oled_ok && !g_oled_show_list) {
+    oledShowServer("scanning", 0, millis()/1000);
   }
 }
 
@@ -461,7 +565,7 @@ void server_bridgeUsbBle(){
       LOGF("[SERVER] got SWITCH evt from client -> LED on PIN_022 = %s",
            (!state) ? "ON" : "OFF");
 
-      if (g_oled_ok) {
+      if (g_oled_ok && !g_oled_show_list) {
         display.setTextSize(1);
         display.setTextColor(SSD1306_WHITE);
         display.setCursor(80, (OLED_H >= 64) ? 40 : 24);
@@ -469,7 +573,21 @@ void server_bridgeUsbBle(){
         display.println((!state) ? "ON" : "OFF");
         oledSafeDisplay();
       }
-    } else {
+    }
+    else if (s.startsWith("KEY A")) {
+      LOGF("[SERVER] got KEY A");
+      // ustaw tylko flagę; HID zrobimy w pętli głównej
+      g_hid_a_pending = true;
+
+      if (g_oled_ok && !g_oled_show_list) {
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(80, (OLED_H >= 64) ? 40 : 24);
+        display.print("HID: a");
+        oledSafeDisplay();
+      }
+    }
+    else {
       LOGF("[BLE] %s", s.c_str());
     }
   }
@@ -481,9 +599,13 @@ void run_server(){
   Bluefruit.setTxPower(4);
   clientUart.begin();
 
-  // ===== LED na PIN_022 (serwer) =====
+  // LED na PIN_022 (serwer)
   pinMode(IO_PIN_022, OUTPUT);
   digitalWrite(IO_PIN_022, LOW);           // LED OFF
+
+  // Przycisk listy
+  pinMode(BTN_LIST_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BTN_LIST_PIN), btn024_isr, FALLING);
 
   // wczytaj bazę ID, deduplikuj i ustaw startowy kandydat
   iddb_load();
@@ -506,12 +628,12 @@ void run_server(){
   Bluefruit.Scanner.useActiveScan(true);
   Bluefruit.Scanner.start(0);
 
-  LOGF("[BOOT] role=SERVER");
-  if (g_oled_ok) {
-    oledShowServer("scanning", "", millis()/1000);
+  LOGF("[BOOT] role=SERVER]");
+  if (g_oled_ok && !g_oled_show_list) {
+    oledShowServer("scanning", 0, millis()/1000);
   }
 
-  // [NB] Nieblokujący heartbeat LED_PIN (zamiast delay(20)/delay(380))
+  // [NB] Nieblokujący heartbeat LED_PIN
   bool srv_led_state = false;
   uint32_t srv_led_next = millis();
   const uint16_t SRV_LED_ON_MS  = 20;
@@ -521,7 +643,23 @@ void run_server(){
   bool wasConnected = false;
 
   while (true) {
-    // [NB] Heartbeat LED bez delay
+    // —— Toggle trybu wyświetlania po naciśnięciu BTN PIN_024 ——
+    if (g_btn024_irq) {
+      noInterrupts(); g_btn024_irq = false; interrupts();
+      g_oled_show_list = !g_oled_show_list;
+
+      if (g_oled_ok) {
+        if (g_oled_show_list) {
+          oledShowClientsList();
+        } else {
+          const char* bleStateTxt = (g_conn != BLE_CONN_HANDLE_INVALID) ? "connected" : "scanning";
+          uint8_t conn_count = (g_conn != BLE_CONN_HANDLE_INVALID) ? 1 : 0;
+          oledShowServer(bleStateTxt, conn_count, millis()/1000);
+        }
+      }
+    }
+
+    // Heartbeat LED bez delay
     uint32_t now = millis();
     if (now >= srv_led_next) {
       srv_led_state = !srv_led_state;
@@ -532,30 +670,32 @@ void run_server(){
     server_pollDock_andAssign();
     server_bridgeUsbBle();
 
-    // heartbeat co sekundę + inline lista klientów
+    // --- HID tap z lockoutem (po stronie serwera) ---
+    if (g_hid_a_pending) {
+      noInterrupts(); g_hid_a_pending = false; interrupts();
+
+      uint32_t now_ms = millis();
+      if (now_ms - g_hid_last_tap_ms >= 120) { // min. odstęp 120 ms
+        hid_send_key_a_safe();
+        g_hid_last_tap_ms = now_ms;
+      } else {
+        // zbyt szybko – pomiń duplikat
+      }
+    }
+
+    // heartbeat co sekundę + inline lista klientów do logów
     if (millis() - last > 1000) {
       last = millis();
       char clients[512]; format_clients_inline(clients, sizeof(clients));
-      char active[64] = "";
-      if (g_active_id) {
-        char macStr[18];
-        sprintf(macStr,"%02X:%02X:%02X:%02X:%02X:%02X",
-                g_active_mac[5],g_active_mac[4],g_active_mac[3],
-                g_active_mac[2],g_active_mac[1],g_active_mac[0]);
-        snprintf(active,sizeof(active),"ID=%lu %s",
-                (unsigned long)g_active_id, macStr);
-      }
 
       const char* bleStateTxt = (g_conn != BLE_CONN_HANDLE_INVALID) ? "connected" : "scanning";
+      uint8_t conn_count = (g_conn != BLE_CONN_HANDLE_INVALID) ? 1 : 0;
 
-      LOGF("[SERVER] uptime=%lus BLE=%s | clients: %s%s",
-          millis()/1000,
-          bleStateTxt,
-          clients,
-          (active[0] ? " [connected: ...]" : ""));
+      LOGF("[SERVER] uptime=%lus BLE=%s | clients: %s",
+          millis()/1000, bleStateTxt, clients);
 
-      if (g_oled_ok) {
-        oledShowServer(bleStateTxt, active, millis()/1000);
+      if (g_oled_ok && !g_oled_show_list) {
+        oledShowServer(bleStateTxt, conn_count, millis()/1000);
       }
     }
 
@@ -583,7 +723,6 @@ void run_server(){
       wasConnected = false;
     }
 
-    // [NB] żadnych delay tutaj
     yield();
   }
 }
@@ -628,6 +767,10 @@ void run_client_idle_or_ble(){
   pinMode(IO_PIN_022, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(IO_PIN_022), sw_isr, FALLING);
 
+  // Drugi przycisk klienta na PIN_024 → wysyłka KEY A
+  pinMode(PIN_024, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_024), btn024_client_isr, FALLING);
+
   // [NB] Nieblokujący heartbeat w trybie IDLE
   bool cli_idle_led_state = false;
   uint32_t cli_idle_led_next = millis();
@@ -640,7 +783,7 @@ void run_client_idle_or_ble(){
 
     while(true){
       uint32_t now = millis();
-      if (now >= cli_idle_led_next) {        // [NB] heartbeat bez delay
+      if (now >= cli_idle_led_next) {
         cli_idle_led_state = !cli_idle_led_state;
         digitalWrite(LED_PIN, cli_idle_led_state ? HIGH : LOW);
         cli_idle_led_next = now + (cli_idle_led_state ? CLI_IDLE_ON_MS : CLI_IDLE_OFF_MS);
@@ -656,7 +799,6 @@ void run_client_idle_or_ble(){
         LOGF("[CLIENT] advertising started (LED ON)");
         break;
       }
-      // [NB] brak delay; szybka pętla
       yield();
     }
   } else {
@@ -691,7 +833,7 @@ void run_client_idle_or_ble(){
       }
     }
 
-    // natychmiastowa reakcja na przycisk (bez delay)
+    // przycisk na PIN_022 (twój istniejący switch)
     if (g_sw_irq_flag) {
       noInterrupts();
       g_sw_irq_flag = false;
@@ -717,6 +859,26 @@ void run_client_idle_or_ble(){
       }
     }
 
+    // NOWE: przycisk na PIN_024 → wyślij „KEY A”
+    if (g_btn024_cli_irq) {
+      noInterrupts(); g_btn024_cli_irq = false; interrupts();
+
+      if (Bluefruit.connected()) {
+        bleuart.write((const uint8_t*)"KEY A\n", 6);
+        LOGF("[CLIENT] sent KEY A to server");
+
+        if (g_oled_ok) {
+          display.setTextSize(1);
+          display.setTextColor(SSD1306_WHITE);
+          display.setCursor(0, (OLED_H >= 64) ? 24 : 16);
+          display.println("KEY A sent");
+          oledSafeDisplay();
+        }
+      } else {
+        LOGF("[CLIENT] PIN_024 press, but not connected – skipped");
+      }
+    }
+
     // ewentualny reassign przez dock
     if (UART_DOCK.available()){
       String l = readLine(UART_DOCK,5);
@@ -726,13 +888,15 @@ void run_client_idle_or_ble(){
       }
     }
 
-    // [NB] brak delay(10); pętla szybka
     yield();
   }
 }
 
 // ===== MAIN =====
 void setup(){
+  // HID zaczynamy wcześnie, żeby host widział urządzenie jako CDC+HID
+  usb_hid.begin();
+
   pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
   UART_DOCK.setPins(UART_RX_PIN, UART_TX_PIN);
   UART_DOCK.begin(UART_BAUD);
@@ -753,12 +917,12 @@ void setup(){
   }
 
   LOGF("[IO] PIN_022 configured: server=LED (OUTPUT), client=SWITCH (INPUT_PULLUP)");
+  LOGF("[IO] PIN_024 configured: server=BTN (INPUT_PULLUP) / client=KEY A button");
 
-  // Faza BOOT może pozostać z małym blokowaniem – nie wpływa na runtime
+  // Faza BOOT (krótka)
   uint32_t t0=millis();
   while(!usb_mounted() && millis()-t0<6000){
     LOGF("[BOOT] waiting for USB...");
-    // krótki efekt – ale tylko podczas BOOT
     digitalWrite(LED_PIN, !digitalRead(LED_PIN));
     delay(200);
   }
