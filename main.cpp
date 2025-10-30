@@ -24,13 +24,12 @@ extern "C" {
 #define LED_PIN PIN_015
 
 #ifndef PIN_022
-#define PIN_022 (22)     // teraz: SWITCH (client) / LED (server)
+#define PIN_022 (22)     // klient: SWITCH input / serwer: LED output
 #endif
 #define IO_PIN_022 PIN_022
 
-// — Przycisk listy na PIN_024 —
 #ifndef PIN_024
-#define PIN_024 (24)             // przycisk trybu listy (serwer) / KEY A (klient)
+#define PIN_024 (24)     // serwer: przycisk listy / klient: klawisz "A"
 #endif
 #define BTN_LIST_PIN PIN_024
 
@@ -38,10 +37,9 @@ extern "C" {
 #define UART_DOCK Serial1
 #define UART_BAUD 115200
 
-// <<< USTAW swoje piny UART (numery portów nRF52, np. P0.08 => 8) >>>
+// UART pins (nRF52 P0.xx numbers)
 #define UART_RX_PIN  8
 #define UART_TX_PIN  6
-// ===========================================
 
 // ===== OLED =====
 #ifndef OLED_ADDR
@@ -51,29 +49,75 @@ extern "C" {
   #define OLED_W 128
 #endif
 #ifndef OLED_H
-  #define OLED_H 32   // jeśli masz 128x64, zmień na 64
+  #define OLED_H 32   // zmień na 64 jeśli masz 128x64
 #endif
 
 Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, -1);
 static bool g_oled_ok = false;
 
-// —— Tryb listy klientów (serwer) ——
+// —— tryb listy klientów na OLED (serwer) ——
 static bool g_oled_show_list = false;
 
-static inline void oledSafeDisplay() { if (g_oled_ok) display.display(); }
+// ===== FLASH CONFIG KLIENTA =====
+struct ClientConfig { uint32_t magic; uint32_t client_id; };
+static const uint32_t CFG_MAGIC = 0x52494E4B;          // 'RINK'
+static const char*    CFG_PATH  = "/client_cfg.bin";
+ClientConfig g_cfg;
 
-static void oledBoot(const char* msg) {
-  if (!g_oled_ok) return;
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0,0);
-  display.println("BOOT...");
-  display.println(msg);
-  oledSafeDisplay();
+// ===== Utils =====
+static inline bool usb_mounted() { return TinyUSBDevice.mounted(); }
+static inline void soft_reset()  { NVIC_SystemReset(); }
+
+static inline void ledBlink(uint8_t n, uint16_t on=60, uint16_t off=120){
+  for(uint8_t i=0;i<n;i++){
+    digitalWrite(LED_PIN,HIGH); delay(on);
+    digitalWrite(LED_PIN,LOW);  delay(off);
+  }
 }
 
-// —— Ekran główny SERWERA (bez ID/MAC) — BLE + up + liczba połączeń ——
+static inline String readLine(Stream& s, uint32_t to_ms=500){
+  uint32_t t0=millis(); String line;
+  while(millis()-t0<to_ms){
+    while(s.available()){
+      char c=(char)s.read();
+      if(c=='\n') return line;
+      if(c!='\r') line+=c;
+    }
+    yield();
+  }
+  return "";
+}
+
+static inline String macToString(const uint8_t mac[6]){
+  char b[18];
+  sprintf(b,"%02X:%02X:%02X:%02X:%02X:%02X",
+          mac[5],mac[4],mac[3],mac[2],mac[1],mac[0]);
+  return String(b);
+}
+
+// Stabilne logowanie: zawsze CRLF
+static inline void LOGF(const char* fmt, ...) {
+  char buf[220];
+  va_list ap; va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  USB_LOG.print(buf);
+  USB_LOG.print("\r\n");
+  USB_LOG.flush();
+}
+
+// Prawdziwy RSSI (N/A gdy brak próbki)
+static inline int getRealRssi(uint16_t conn_handle) {
+  int8_t rssi_value = 0;
+  uint8_t ch_index = 0;
+  uint32_t err = sd_ble_gap_rssi_get(conn_handle, &rssi_value, &ch_index);
+  if (err == NRF_SUCCESS) return (int)rssi_value;
+  return INT16_MIN; // brak danych
+}
+
+// ===== OLED helpers =====
+static inline void oledSafeDisplay() { if (g_oled_ok) display.display(); }
+
 static void oledShowServer(const char* bleState, uint8_t conn_count, uint32_t uptime_s) {
   if (!g_oled_ok) return;
   display.clearDisplay();
@@ -114,60 +158,6 @@ static void oledShowClientBLE(uint32_t id, bool connected, uint32_t uptime_s) {
   oledSafeDisplay();
 }
 
-// ===== FLASH CONFIG KLIENTA =====
-struct ClientConfig { uint32_t magic; uint32_t client_id; };
-static const uint32_t CFG_MAGIC = 0x52494E4B;          // 'RINK'
-static const char*    CFG_PATH  = "/client_cfg.bin";
-ClientConfig g_cfg;
-
-// ===== Utils =====
-static inline bool usb_mounted() { return TinyUSBDevice.mounted(); }
-static inline void soft_reset()  { NVIC_SystemReset(); }
-
-// (pozostawiamy – używane rzadko; nie wpływa na pętle główne)
-static inline void ledBlink(uint8_t n, uint16_t on=60, uint16_t off=120){
-  for(uint8_t i=0;i<n;i++){ digitalWrite(LED_PIN,HIGH); delay(on); digitalWrite(LED_PIN,LOW); delay(off); }
-}
-
-static inline String readLine(Stream& s, uint32_t to_ms=500){
-  uint32_t t0=millis(); String line;
-  while(millis()-t0<to_ms){
-    while(s.available()){
-      char c=(char)s.read();
-      if(c=='\n') return line;
-      if(c!='\r') line+=c;
-    }
-    yield();
-  }
-  return "";
-}
-
-static inline String macToString(const uint8_t mac[6]){
-  char b[18];
-  sprintf(b,"%02X:%02X:%02X:%02X:%02X:%02X",mac[5],mac[4],mac[3],mac[2],mac[1],mac[0]);
-  return String(b);
-}
-
-// Stabilne logowanie: zawsze CRLF
-static inline void LOGF(const char* fmt, ...) {
-  char buf[220];
-  va_list ap; va_start(ap, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, ap);
-  va_end(ap);
-  USB_LOG.print(buf);
-  USB_LOG.print("\r\n");
-  USB_LOG.flush();
-}
-
-// Prawdziwy RSSI (N/A gdy brak próbki)
-static inline int getRealRssi(uint16_t conn_handle) {
-  int8_t rssi_value = 0;
-  uint8_t ch_index = 0;
-  uint32_t err = sd_ble_gap_rssi_get(conn_handle, &rssi_value, &ch_index);
-  if (err == NRF_SUCCESS) return (int)rssi_value;
-  return INT16_MIN; // brak danych
-}
-
 // ===== KLIENT: zapis/odczyt ID =====
 bool cfg_load() {
   if (!InternalFS.begin()) return false;
@@ -187,7 +177,7 @@ bool cfg_save() {
   return n == sizeof(ClientConfig);
 }
 
-// Parser nazwy z ADV (dla 1.6.x)
+// Parser nazwy z ADV (dla 1.6.x Bluefruit)
 bool adv_get_name(ble_gap_evt_adv_report_t* rpt, char* out, size_t outlen) {
   if (!rpt || !out || outlen == 0) return false;
   out[0] = 0;
@@ -217,7 +207,7 @@ static const char* SERVER_ID_DB = "/server_ids.bin";
 static const uint32_t MAX_IDS = 128;
 static IdEntry g_ids[MAX_IDS];
 static uint32_t g_ids_count = 0;
-static uint32_t g_next_id = 1;        // kandydat startowy (przesuwany po ACK)
+static uint32_t g_next_id = 1;        // start next candidate
 
 static bool iddb_load() {
   if (!InternalFS.begin()) return false;
@@ -241,7 +231,6 @@ static bool id_is_used(uint32_t id) {
   return false;
 }
 
-// ——— deduplikacja i indeksy ———
 static int idx_by_mac(const uint8_t mac[6]){
   for (uint32_t i=0;i<g_ids_count;i++){
     if (memcmp(g_ids[i].mac, mac, 6)==0) return (int)i;
@@ -260,21 +249,20 @@ static void remove_idx(int idx){
   g_ids_count--;
 }
 
-// ——— główna funkcja zapisu z deduplikacją ———
 static void id_set(uint32_t id, const uint8_t mac[6]) {
   int i_mac = idx_by_mac(mac);
   int i_id  = idx_by_id(id);
 
   if (i_mac >= 0 && i_id >= 0) {
-    if (i_mac != i_id) {            // scal duplikaty
+    if (i_mac != i_id) {
       memcpy(g_ids[i_id].mac, mac, 6);
       remove_idx(i_mac);
     }
-  } else if (i_id >= 0) {           // istnieje ID → zaktualizuj MAC
+  } else if (i_id >= 0) {
     memcpy(g_ids[i_id].mac, mac, 6);
-  } else if (i_mac >= 0) {          // istnieje MAC → zaktualizuj ID
+  } else if (i_mac >= 0) {
     g_ids[i_mac].id = id;
-  } else if (g_ids_count < MAX_IDS) { // nowy wpis
+  } else if (g_ids_count < MAX_IDS) {
     g_ids[g_ids_count].id = id;
     memcpy(g_ids[g_ids_count].mac, mac, 6);
     g_ids_count++;
@@ -288,7 +276,7 @@ static uint32_t id_next_free(uint32_t start_from=1) {
   return cand;
 }
 
-// 🔹 formatter inline do logów „clients: ID=.. MAC=.., ...”
+// format klientów do logów
 static void format_clients_inline(char* out, size_t outlen) {
   if (!out || outlen == 0) return;
   out[0] = 0;
@@ -296,19 +284,21 @@ static void format_clients_inline(char* out, size_t outlen) {
   size_t used = 0;
   for (uint32_t i=0; i<g_ids_count; ++i) {
     char macStr[18];
-    sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X",
+    sprintf(macStr,"%02X:%02X:%02X:%02X:%02X:%02X",
             g_ids[i].mac[5], g_ids[i].mac[4], g_ids[i].mac[3],
             g_ids[i].mac[2], g_ids[i].mac[1], g_ids[i].mac[0]);
-    int n = snprintf(out + used, (used < outlen ? outlen - used : 0),
+    int n = snprintf(out + used,
+                     (used < outlen ? outlen - used : 0),
                      "%sID=%lu MAC=%s",
-                     (i==0 ? "" : ", "), (unsigned long)g_ids[i].id, macStr);
+                     (i==0 ? "" : ", "),
+                     (unsigned long)g_ids[i].id, macStr);
     if (n < 0) break;
     used += (size_t)n;
     if (used >= outlen) { out[outlen-1]=0; break; }
   }
 }
 
-// ====== OLED: lista klientów (ID + MAC, bez '=') ======
+// OLED lista klientów
 static void oledShowClientsList() {
   if (!g_oled_ok) return;
 
@@ -318,7 +308,6 @@ static void oledShowClientsList() {
   display.setCursor(0,0);
   display.println("CLIENTS");
 
-  // 8 px / wiersz
   uint8_t maxRows = OLED_H / 8;
   if (maxRows == 0) maxRows = 1;
   uint8_t rowsAvail = (maxRows > 1) ? (maxRows - 1) : 0;
@@ -326,11 +315,10 @@ static void oledShowClientsList() {
   uint8_t shown = 0;
   for (uint32_t i = 0; i < g_ids_count && shown < rowsAvail; ++i) {
     char macStr[18];
-    sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X",
+    sprintf(macStr,"%02X:%02X:%02X:%02X:%02X:%02X",
             g_ids[i].mac[5], g_ids[i].mac[4], g_ids[i].mac[3],
             g_ids[i].mac[2], g_ids[i].mac[1], g_ids[i].mac[0]);
 
-    // Bez '=': "ID<nr>  <MAC>"
     display.print("ID");
     display.print((unsigned long)g_ids[i].id);
     display.print("  ");
@@ -347,40 +335,62 @@ static void oledShowClientsList() {
 }
 
 // ================== USB HID KEYBOARD (SERWER) ==================
-// używamy makra BEZ argumentów
 uint8_t const desc_hid_report[] = { TUD_HID_REPORT_DESC_KEYBOARD() };
 
 Adafruit_USBD_HID usb_hid(desc_hid_report, sizeof(desc_hid_report),
                           HID_ITF_PROTOCOL_KEYBOARD, 10, false);
 
-// --- HID tap queue (server) ---
-static volatile bool g_hid_a_pending = false;
-static uint32_t g_hid_last_tap_ms = 0;
-
-// bezpieczny „tap” klawisza
-static inline void hid_tap_key(uint8_t key, uint16_t down_ms = 15, uint16_t post_ms = 2) {
+// Tap (debug / awaryjnie)
+static void hid_tap_key_immediate(uint8_t keycode) {
   if (!TinyUSBDevice.mounted()) return;
 
   if (TinyUSBDevice.suspended()) {
     TinyUSBDevice.remoteWakeup();
-    delay(5);
+    delay(2);
+  }
+
+  {
+    uint32_t t0 = millis();
+    while (!usb_hid.ready() && (millis() - t0) < 30) { yield(); }
+    uint8_t keys[6] = { keycode, 0,0,0,0,0 };
+    usb_hid.keyboardReport(0, 0, keys);   // key down
+  }
+
+  delay(10);
+
+  {
+    uint32_t t0 = millis();
+    while (!usb_hid.ready() && (millis() - t0) < 30) { yield(); }
+    uint8_t empty[6] = {0,0,0,0,0,0};
+    usb_hid.keyboardReport(0, 0, empty);  // key up
+  }
+}
+
+// HOLD-style: naciśnij i TRZYMAJ
+static void hid_key_down(uint8_t keycode) {
+  if (!TinyUSBDevice.mounted()) return;
+
+  if (TinyUSBDevice.suspended()) {
+    TinyUSBDevice.remoteWakeup();
+    delay(2);
   }
 
   uint32_t t0 = millis();
-  while (!usb_hid.ready() && (millis() - t0) < 50) { yield(); }
+  while (!usb_hid.ready() && (millis() - t0) < 30) { yield(); }
 
-  uint8_t keys[6] = { key, 0,0,0,0,0 };
-  usb_hid.keyboardReport(0, 0, keys);   // PRESS
-  delay(down_ms);                       // >= 1 okresu pollingu (10 ms)
-
-  uint8_t empty[6] = {0};
-  usb_hid.keyboardReport(0, 0, empty);  // RELEASE
-  delay(post_ms);
+  uint8_t keys[6] = { keycode, 0,0,0,0,0 };
+  usb_hid.keyboardReport(0, 0, keys); // key held down
 }
 
-// dedykowane 'a'
-static inline void hid_send_key_a_safe() {
-  hid_tap_key(HID_KEY_A, 15, 2);
+// PUŚĆ WSZYSTKO
+static void hid_key_up_all() {
+  if (!TinyUSBDevice.mounted()) return;
+
+  uint32_t t0 = millis();
+  while (!usb_hid.ready() && (millis() - t0) < 30) { yield(); }
+
+  uint8_t empty[6] = {0,0,0,0,0,0};
+  usb_hid.keyboardReport(0, 0, empty); // release
 }
 
 // ================== BLE ==================
@@ -393,7 +403,7 @@ static uint8_t  g_active_mac[6] = {0};
 // ===== SWITCH (CLIENT) — ISR =====
 volatile bool     g_sw_irq_flag = false;
 volatile uint32_t g_sw_count    = 0;
-volatile uint32_t g_sw_last_us  = 0;  // debounce w ISR (micros)
+volatile uint32_t g_sw_last_us  = 0;
 static void sw_isr() {
   uint32_t now = micros();
   if (now - g_sw_last_us < 150000U) return; // ~150 ms debounce
@@ -407,28 +417,21 @@ volatile bool     g_btn024_irq     = false;
 volatile uint32_t g_btn024_last_us = 0;
 static void btn024_isr() {
   uint32_t now = micros();
-  if (now - g_btn024_last_us < 150000U) return; // ~150 ms debounce
+  if (now - g_btn024_last_us < 150000U) return;
   g_btn024_last_us = now;
   g_btn024_irq = true;
-}
-
-// ===== KLIENT: przycisk na PIN_024 → wysyłka KEY A — ISR =====
-volatile bool     g_btn024_cli_irq     = false;
-volatile uint32_t g_btn024_cli_last_us = 0;
-static void btn024_client_isr() {
-  uint32_t now = micros();
-  if (now - g_btn024_cli_last_us < 200000U) return; // 200 ms debounce (stabilniej)
-  g_btn024_cli_last_us = now;
-  g_btn024_cli_irq = true;
 }
 
 // ===== SERVER CALLBACKS =====
 void server_connect_cb(uint16_t conn_handle) {
   g_conn = conn_handle;
-  ledBlink(2,60,80); // rzadkie
+  ledBlink(2,60,80);
 
   bool ok = false;
-  for (int i=0; i<3 && !ok; ++i) { ok = clientUart.discover(conn_handle); if (!ok) delay(150); }
+  for (int i=0; i<3 && !ok; ++i) {
+    ok = clientUart.discover(conn_handle);
+    if (!ok) delay(150);
+  }
   if (!ok) {
     LOGF("[SERVER] BLE discovery failed (3x), disconnecting");
     Bluefruit.disconnect(conn_handle);
@@ -441,7 +444,7 @@ void server_connect_cb(uint16_t conn_handle) {
   int rssi_meas = getRealRssi(conn_handle);
 
   char macStr[18];
-  sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X",
+  sprintf(macStr,"%02X:%02X:%02X:%02X:%02X:%02X",
           addr.addr[5], addr.addr[4], addr.addr[3],
           addr.addr[2], addr.addr[1], addr.addr[0]);
 
@@ -475,14 +478,14 @@ void server_disconnect_cb(uint16_t, uint8_t reason) {
 
   memset(g_active_mac,0,sizeof(g_active_mac));
   g_active_id = 0;
-  ledBlink(1,200,200); // rzadkie
+  ledBlink(1,200,200);
 
   if (g_oled_ok && !g_oled_show_list) {
     oledShowServer("scanning", 0, millis()/1000);
   }
 }
 
-// ===== SERVER SCAN CB (UUID + nazwa fallback) =====
+// ===== SERVER SCAN CB =====
 void server_scan_cb(ble_gap_evt_adv_report_t* report){
   if (Bluefruit.Scanner.checkReportForService(report, clientUart)) {
     Bluefruit.Scanner.stop();
@@ -510,13 +513,17 @@ void server_pollDock_andAssign() {
   static uint8_t last_mac[6] = {0};
 
   if (state == WAIT_HELLO) {
-    if (millis() - lastWHO > 800) { lastWHO = millis(); UART_DOCK.println("WHO"); }
+    if (millis() - lastWHO > 800) {
+      lastWHO = millis();
+      UART_DOCK.println("WHO");
+    }
     String line = readLine(UART_DOCK, 10);
     if (line.startsWith("HELLO ")) {
       memset(last_mac, 0, sizeof(last_mac));
       String macStr = line.substring(6);
       int b[6]={0};
-      if (sscanf(macStr.c_str(), "%02x:%02x:%02x:%02x:%02x:%02x",
+      if (sscanf(macStr.c_str(),
+                 "%02x:%02x:%02x:%02x:%02x:%02x",
                  &b[5],&b[4],&b[3],&b[2],&b[1],&b[0])==6) {
         for (int i=0;i<6;i++) last_mac[i]=(uint8_t)b[i];
       }
@@ -524,9 +531,13 @@ void server_pollDock_andAssign() {
       if (known >= 0) assigned = g_ids[known].id;
       else            assigned = id_next_free(g_next_id);
 
-      UART_DOCK.print("ASSIGN "); UART_DOCK.println(assigned);
-      LOGF("[SERVER] assign %lu to %s (wait ack)", (unsigned long)assigned, macStr.c_str());
-      retries = 0; tAssign = millis(); state = SENT_ASSIGN;
+      UART_DOCK.print("ASSIGN ");
+      UART_DOCK.println(assigned);
+      LOGF("[SERVER] assign %lu to %s (wait ack)",
+           (unsigned long)assigned, macStr.c_str());
+      retries = 0;
+      tAssign = millis();
+      state = SENT_ASSIGN;
     }
   } else { // SENT_ASSIGN
     String ack = readLine(UART_DOCK, 10);
@@ -535,7 +546,7 @@ void server_pollDock_andAssign() {
       id_set(assigned, last_mac);
       if (assigned >= g_next_id) g_next_id = assigned + 1;
       UART_DOCK.println("GO");
-      ledBlink(2,120,120); // sporadyczne
+      ledBlink(2,120,120);
       lastWHO = millis() + 2000;
       state = WAIT_HELLO;
       return;
@@ -543,25 +554,37 @@ void server_pollDock_andAssign() {
     if (millis() - tAssign > 600) {
       if (++retries <= 3) {
         tAssign = millis();
-        UART_DOCK.print("ASSIGN "); UART_DOCK.println(assigned);
-        LOGF("[SERVER] retry %u for ID %lu", retries, (unsigned long)assigned);
+        UART_DOCK.print("ASSIGN ");
+        UART_DOCK.println(assigned);
+        LOGF("[SERVER] retry %u for ID %lu",
+             retries, (unsigned long)assigned);
       } else {
-        LOGF("[SERVER] no-ack for ID %lu, giving up", (unsigned long)assigned);
+        LOGF("[SERVER] no-ack for ID %lu, giving up",
+             (unsigned long)assigned);
         state = WAIT_HELLO;
       }
     }
   }
 }
 
+// ===== SERWER most BLE <-> USB LOG + HID =====
 void server_bridgeUsbBle(){
+  // host USB -> BLE echo
   if (g_conn!=BLE_CONN_HANDLE_INVALID && USB_LOG.available()){
-    while(USB_LOG.available()){ char c=USB_LOG.read(); clientUart.write(&c,1); if(c=='\n') break; }
+    while(USB_LOG.available()){
+      char c=USB_LOG.read();
+      clientUart.write(&c,1);
+      if(c=='\n') break;
+    }
   }
+
+  // BLE -> HID / log / OLED
   if (g_conn!=BLE_CONN_HANDLE_INVALID && clientUart.available()){
     String s = clientUart.readStringUntil('\n');
+
     if (s.startsWith("SW ")) {
       int state = digitalRead(IO_PIN_022);
-      digitalWrite(IO_PIN_022, !state); // TOGGLE LED na serwerze
+      digitalWrite(IO_PIN_022, !state); // TOGGLE LED
       LOGF("[SERVER] got SWITCH evt from client -> LED on PIN_022 = %s",
            (!state) ? "ON" : "OFF");
 
@@ -574,19 +597,33 @@ void server_bridgeUsbBle(){
         oledSafeDisplay();
       }
     }
-    else if (s.startsWith("KEY A")) {
-      LOGF("[SERVER] got KEY A");
-      // ustaw tylko flagę; HID zrobimy w pętli głównej
-      g_hid_a_pending = true;
+
+    else if (s.startsWith("KEY A DOWN")) {
+      LOGF("[SERVER] KEY A DOWN -> hold start");
+      hid_key_down(HID_KEY_A); // trzymaj 'a'
 
       if (g_oled_ok && !g_oled_show_list) {
         display.setTextSize(1);
         display.setTextColor(SSD1306_WHITE);
         display.setCursor(80, (OLED_H >= 64) ? 40 : 24);
-        display.print("HID: a");
+        display.print("A:DOWN");
         oledSafeDisplay();
       }
     }
+
+    else if (s.startsWith("KEY A UP")) {
+      LOGF("[SERVER] KEY A UP -> hold end");
+      hid_key_up_all(); // puść 'a'
+
+      if (g_oled_ok && !g_oled_show_list) {
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(80, (OLED_H >= 64) ? 40 : 24);
+        display.print("A:UP  ");
+        oledSafeDisplay();
+      }
+    }
+
     else {
       LOGF("[BLE] %s", s.c_str());
     }
@@ -601,17 +638,18 @@ void run_server(){
 
   // LED na PIN_022 (serwer)
   pinMode(IO_PIN_022, OUTPUT);
-  digitalWrite(IO_PIN_022, LOW);           // LED OFF
+  digitalWrite(IO_PIN_022, LOW);  // LED OFF
 
-  // Przycisk listy
+  // Przycisk listy (serwer)
   pinMode(BTN_LIST_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(BTN_LIST_PIN), btn024_isr, FALLING);
 
-  // wczytaj bazę ID, deduplikuj i ustaw startowy kandydat
+  // baza ID
   iddb_load();
   for (uint32_t i=0; i<g_ids_count; ++i){
     for (uint32_t j=i+1; j<g_ids_count; ){
-      if (memcmp(g_ids[i].mac, g_ids[j].mac, 6)==0 || g_ids[i].id==g_ids[j].id){
+      if (memcmp(g_ids[i].mac, g_ids[j].mac, 6)==0 ||
+          g_ids[i].id==g_ids[j].id){
         remove_idx(j);
       } else ++j;
     }
@@ -633,7 +671,7 @@ void run_server(){
     oledShowServer("scanning", 0, millis()/1000);
   }
 
-  // [NB] Nieblokujący heartbeat LED_PIN
+  // heartbeat LED_PIN na serwerze (mruga, non-blocking)
   bool srv_led_state = false;
   uint32_t srv_led_next = millis();
   const uint16_t SRV_LED_ON_MS  = 20;
@@ -643,7 +681,7 @@ void run_server(){
   bool wasConnected = false;
 
   while (true) {
-    // —— Toggle trybu wyświetlania po naciśnięciu BTN PIN_024 ——
+    // toggle trybu wyświetlania listy klientów
     if (g_btn024_irq) {
       noInterrupts(); g_btn024_irq = false; interrupts();
       g_oled_show_list = !g_oled_show_list;
@@ -652,47 +690,36 @@ void run_server(){
         if (g_oled_show_list) {
           oledShowClientsList();
         } else {
-          const char* bleStateTxt = (g_conn != BLE_CONN_HANDLE_INVALID) ? "connected" : "scanning";
+          const char* bleStateTxt = (g_conn != BLE_CONN_HANDLE_INVALID)
+                                    ? "connected" : "scanning";
           uint8_t conn_count = (g_conn != BLE_CONN_HANDLE_INVALID) ? 1 : 0;
           oledShowServer(bleStateTxt, conn_count, millis()/1000);
         }
       }
     }
 
-    // Heartbeat LED bez delay
-    uint32_t now = millis();
-    if (now >= srv_led_next) {
+    // heartbeat LED na serwerze bez delay()
+    uint32_t now_ms = millis();
+    if (now_ms >= srv_led_next) {
       srv_led_state = !srv_led_state;
       digitalWrite(LED_PIN, srv_led_state ? HIGH : LOW);
-      srv_led_next = now + (srv_led_state ? SRV_LED_ON_MS : SRV_LED_OFF_MS);
+      srv_led_next = now_ms + (srv_led_state ? SRV_LED_ON_MS : SRV_LED_OFF_MS);
     }
 
     server_pollDock_andAssign();
     server_bridgeUsbBle();
 
-    // --- HID tap z lockoutem (po stronie serwera) ---
-    if (g_hid_a_pending) {
-      noInterrupts(); g_hid_a_pending = false; interrupts();
-
-      uint32_t now_ms = millis();
-      if (now_ms - g_hid_last_tap_ms >= 120) { // min. odstęp 120 ms
-        hid_send_key_a_safe();
-        g_hid_last_tap_ms = now_ms;
-      } else {
-        // zbyt szybko – pomiń duplikat
-      }
-    }
-
-    // heartbeat co sekundę + inline lista klientów do logów
+    // heartbeat log raz na sekundę
     if (millis() - last > 1000) {
       last = millis();
       char clients[512]; format_clients_inline(clients, sizeof(clients));
 
-      const char* bleStateTxt = (g_conn != BLE_CONN_HANDLE_INVALID) ? "connected" : "scanning";
+      const char* bleStateTxt = (g_conn != BLE_CONN_HANDLE_INVALID)
+                                ? "connected" : "scanning";
       uint8_t conn_count = (g_conn != BLE_CONN_HANDLE_INVALID) ? 1 : 0;
 
       LOGF("[SERVER] uptime=%lus BLE=%s | clients: %s",
-          millis()/1000, bleStateTxt, clients);
+           millis()/1000, bleStateTxt, clients);
 
       if (g_oled_ok && !g_oled_show_list) {
         oledShowServer(bleStateTxt, conn_count, millis()/1000);
@@ -713,10 +740,12 @@ void run_server(){
       char name[32] = {0};
       if (conn) conn->getPeerName(name, sizeof(name));
       int r = getRealRssi(g_conn);
-      if (r == INT16_MIN) LOGF("[SERVER] New BLE connection: handle=%u, name=%s, RSSI=N/A",
-                               g_conn, (name[0]?name:"(unknown)"));
-      else LOGF("[SERVER] New BLE connection: handle=%u, name=%s, RSSI=%d dBm",
-                g_conn, (name[0]?name:"(unknown)"), r);
+      if (r == INT16_MIN)
+        LOGF("[SERVER] New BLE connection: handle=%u, name=%s, RSSI=N/A",
+             g_conn, (name[0]?name:"(unknown)"));
+      else
+        LOGF("[SERVER] New BLE connection: handle=%u, name=%s, RSSI=%d dBm",
+             g_conn, (name[0]?name:"(unknown)"), r);
       wasConnected = true;
     } else if (!isConnected && wasConnected) {
       LOGF("[SERVER] BLE disconnected");
@@ -728,6 +757,79 @@ void run_server(){
 }
 
 // ===== KLIENT =====
+//
+// Zachowanie jak prawdziwy klawisz: wysyłamy DOWN raz przy wciśnięciu,
+// UP raz przy puszczeniu. OS sam robi repeat lub popup akcentów.
+//
+// Mocny debounce: wymagamy stabilnego stanu przez BTN_STABLE_MS
+// zanim uznamy że faktycznie się zmienił. To eliminuje "aa" z drgań.
+
+static const bool BTN_ACTIVE_LOW = true;        // true: guzik do GND, INPUT_PULLUP
+static const uint32_t BTN_STABLE_MS = 40;       // ile ms stan musi być stabilny
+
+static bool     btn_raw_last          = true;   // ostatni surowy stan pinu
+static uint32_t btn_raw_change_ms     = 0;      // kiedy zaobserwowaliśmy zmianę raw
+static bool     btn_filtered_state    = true;   // stan po debounce (HIGH = puść przy INPUT_PULLUP)
+static bool     btn_pressed_logical   = false;  // czy logicznie "jest wciśnięty"
+
+static inline bool hw_is_pressed(bool raw_level) {
+  // przy INPUT_PULLUP: LOW = pressed, HIGH = released
+  return BTN_ACTIVE_LOW ? (!raw_level) : (raw_level);
+}
+
+// helper do wysyłania komendy do serwera
+static void client_send_line(const char* line) {
+  if (Bluefruit.connected()) {
+    bleuart.write((const uint8_t*)line, strlen(line));
+    LOGF("[CLIENT] SENT: %s", line);
+
+    if (g_oled_ok) {
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 16);
+      display.println(line);
+      oledSafeDisplay();
+    }
+  } else {
+    LOGF("[CLIENT] (not connected) WOULD SEND: %s", line);
+  }
+}
+
+void client_poll_button_sendHID() {
+  uint32_t now = millis();
+  bool raw_now = digitalRead(PIN_024); // HIGH/LOW z pinu
+
+  // jeśli surowy stan się zmienił → zapamiętaj kiedy
+  if (raw_now != btn_raw_last) {
+    btn_raw_last = raw_now;
+    btn_raw_change_ms = now;
+  }
+
+  // jeśli surowy stan != przefiltrowany stan,
+  // i ta różnica jest stabilna już >= BTN_STABLE_MS → zaakceptuj
+  if (raw_now != btn_filtered_state) {
+    if ((now - btn_raw_change_ms) >= BTN_STABLE_MS) {
+      // przyjmij nowy stan jako oficjalny
+      btn_filtered_state = raw_now;
+
+      bool pressed_now = hw_is_pressed(btn_filtered_state);
+
+      // przejście: released -> pressed
+      if (pressed_now && !btn_pressed_logical) {
+        btn_pressed_logical = true;
+        LOGF("[CLIENT] BTN DOWN (debounced) at %lu ms", (unsigned long)now);
+        client_send_line("KEY A DOWN\n");
+      }
+      // przejście: pressed -> released
+      else if (!pressed_now && btn_pressed_logical) {
+        btn_pressed_logical = false;
+        LOGF("[CLIENT] BTN UP (debounced) at %lu ms", (unsigned long)now);
+        client_send_line("KEY A UP\n");
+      }
+    }
+  }
+}
+
 void client_startAdvertising(uint32_t id){
   Bluefruit.Advertising.clearData();
   Bluefruit.ScanResponse.clearData();
@@ -755,23 +857,25 @@ bool client_handleDockOnce_andAssign(){
   g_cfg.client_id = new_id;
   bool ok = cfg_save();
   UART_DOCK.println(ok ? "OK" : "ERR");
-  ledBlink(2,120,120); // sporadyczne
+  ledBlink(2,120,120);
   return ok;
 }
 
 void run_client_idle_or_ble(){
   if (!cfg_load()){ g_cfg.magic=CFG_MAGIC; g_cfg.client_id=0; cfg_save(); }
-  Bluefruit.begin(); Bluefruit.setTxPower(4); bleuart.begin();
+
+  Bluefruit.begin();
+  Bluefruit.setTxPower(4);
+  bleuart.begin();
 
   // SWITCH na PIN_022 (klient) – przycisk do GND
   pinMode(IO_PIN_022, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(IO_PIN_022), sw_isr, FALLING);
 
-  // Drugi przycisk klienta na PIN_024 → wysyłka KEY A
+  // Przycisk "A" na PIN_024
   pinMode(PIN_024, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PIN_024), btn024_client_isr, FALLING);
 
-  // [NB] Nieblokujący heartbeat w trybie IDLE
+  // Heartbeat LED w trybie idle (nieblokująco)
   bool cli_idle_led_state = false;
   uint32_t cli_idle_led_next = millis();
   const uint16_t CLI_IDLE_ON_MS  = 5;
@@ -789,8 +893,12 @@ void run_client_idle_or_ble(){
         cli_idle_led_next = now + (cli_idle_led_state ? CLI_IDLE_ON_MS : CLI_IDLE_OFF_MS);
       }
 
-      if (usb_mounted()){ LOGF("[CLIENT_IDLE] USB mounted -> reset"); soft_reset(); }
+      if (usb_mounted()){
+        LOGF("[CLIENT_IDLE] USB mounted -> reset");
+        soft_reset();
+      }
 
+      // dock assign?
       if (client_handleDockOnce_andAssign()){
         LOGF("[CLIENT_IDLE] got ID=%lu, starting BLE NOW", g_cfg.client_id);
         client_startAdvertising(g_cfg.client_id);
@@ -799,6 +907,11 @@ void run_client_idle_or_ble(){
         LOGF("[CLIENT] advertising started (LED ON)");
         break;
       }
+
+      // już tu reagujemy na przycisk (jak klawisz),
+      // ale jeśli nie connected, to tylko log
+      client_poll_button_sendHID();
+
       yield();
     }
   } else {
@@ -810,7 +923,10 @@ void run_client_idle_or_ble(){
 
   unsigned long last=0;
   while(true){
-    if (usb_mounted()){ LOGF("[CLIENT] USB mounted -> reset"); soft_reset(); }
+    if (usb_mounted()){
+      LOGF("[CLIENT] USB mounted -> reset");
+      soft_reset();
+    }
 
     if (millis()-last>1000){
       last=millis();
@@ -825,6 +941,7 @@ void run_client_idle_or_ble(){
       }
     }
 
+    // jeśli połączenie BLE aktywne, echo danych itp.
     if (Bluefruit.connected()){
       digitalWrite(LED_PIN,HIGH);
       while (bleuart.available()){
@@ -833,7 +950,7 @@ void run_client_idle_or_ble(){
       }
     }
 
-    // przycisk na PIN_022 (twój istniejący switch)
+    // SWITCH na PIN_022 → zgłoś do serwera
     if (g_sw_irq_flag) {
       noInterrupts();
       g_sw_irq_flag = false;
@@ -859,32 +976,21 @@ void run_client_idle_or_ble(){
       }
     }
 
-    // NOWE: przycisk na PIN_024 → wyślij „KEY A”
-    if (g_btn024_cli_irq) {
-      noInterrupts(); g_btn024_cli_irq = false; interrupts();
+    // przycisk litery 'A' → HID DOWN/UP
+    client_poll_button_sendHID();
 
-      if (Bluefruit.connected()) {
-        bleuart.write((const uint8_t*)"KEY A\n", 6);
-        LOGF("[CLIENT] sent KEY A to server");
-
-        if (g_oled_ok) {
-          display.setTextSize(1);
-          display.setTextColor(SSD1306_WHITE);
-          display.setCursor(0, (OLED_H >= 64) ? 24 : 16);
-          display.println("KEY A sent");
-          oledSafeDisplay();
-        }
-      } else {
-        LOGF("[CLIENT] PIN_024 press, but not connected – skipped");
-      }
-    }
-
-    // ewentualny reassign przez dock
+    // dock reassign?
     if (UART_DOCK.available()){
       String l = readLine(UART_DOCK,5);
       if (l.startsWith("ASSIGN ")){
         uint32_t nid = l.substring(7).toInt();
-        if (nid){ g_cfg.client_id=nid; if (cfg_save()){ UART_DOCK.println("OK"); LOGF("[CLIENT] reassign ID=%lu", nid); } }
+        if (nid){
+          g_cfg.client_id=nid;
+          if (cfg_save()){
+            UART_DOCK.println("OK");
+            LOGF("[CLIENT] reassign ID=%lu", nid);
+          }
+        }
       }
     }
 
@@ -894,7 +1000,7 @@ void run_client_idle_or_ble(){
 
 // ===== MAIN =====
 void setup(){
-  // HID zaczynamy wcześnie, żeby host widział urządzenie jako CDC+HID
+  // HID najpierw, żeby host widział CDC+HID
   usb_hid.begin();
 
   pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
@@ -902,7 +1008,7 @@ void setup(){
   UART_DOCK.begin(UART_BAUD);
   USB_LOG.begin(115200);
 
-  // ===== OLED begin =====
+  // OLED init
   Wire.begin();
   g_oled_ok = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   if (!g_oled_ok) {
@@ -917,9 +1023,9 @@ void setup(){
   }
 
   LOGF("[IO] PIN_022 configured: server=LED (OUTPUT), client=SWITCH (INPUT_PULLUP)");
-  LOGF("[IO] PIN_024 configured: server=BTN (INPUT_PULLUP) / client=KEY A button");
+  LOGF("[IO] PIN_024 configured: server=BTN (INPUT_PULLUP) / client='A' key button");
 
-  // Faza BOOT (krótka)
+  // BOOT faza: jeśli USB mounted → serwer, inaczej klient
   uint32_t t0=millis();
   while(!usb_mounted() && millis()-t0<6000){
     LOGF("[BOOT] waiting for USB...");
@@ -931,4 +1037,5 @@ void setup(){
   if (usb_mounted()) run_server();
   else               run_client_idle_or_ble();
 }
+
 void loop(){}
