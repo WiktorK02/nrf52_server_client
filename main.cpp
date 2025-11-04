@@ -24,14 +24,19 @@ extern "C" {
 #define LED_PIN PIN_015
 
 #ifndef PIN_022
-#define PIN_022 (22)     // klient: SWITCH input / serwer: LED output
+#define PIN_022 (22)     // teraz: przycisk klawisza A/B (server i client)
 #endif
-#define IO_PIN_022 PIN_022
+#define IO_PIN_022 PIN_022   // pozostawione dla kompatybilności, ale nieużywane
 
 #ifndef PIN_024
-#define PIN_024 (24)     // serwer: przycisk listy / klient: klawisz "A"
+#define PIN_024 (24)     // serwer: przycisk listy
 #endif
 #define BTN_LIST_PIN PIN_024
+
+#ifndef PIN_029
+#define PIN_029 (29)     // przycisk wyboru strony klawiatury (LEFT/RIGHT)
+#endif
+#define SIDE_BTN_PIN PIN_029
 
 #define USB_LOG   Serial
 #define UART_DOCK Serial1
@@ -40,6 +45,9 @@ extern "C" {
 // UART pins (nRF52 P0.xx numbers)
 #define UART_RX_PIN  8
 #define UART_TX_PIN  6
+
+// PIN klawisza (wspólny dla servera i clienta)
+#define KBD_BTN_PIN PIN_022
 
 // ===== OLED =====
 #ifndef OLED_ADDR
@@ -57,6 +65,10 @@ static bool g_oled_ok = false;
 
 // —— tryb listy klientów na OLED (serwer) ——
 static bool g_oled_show_list = false;
+
+// —— wybór strony klawiatury ——
+static bool g_is_left_side = true;   // true = LEFT => 'A', false = RIGHT => 'B'
+static bool g_is_server    = false;  // ustawiane w setup()
 
 // ===== FLASH CONFIG KLIENTA =====
 struct ClientConfig { uint32_t magic; uint32_t client_id; };
@@ -124,7 +136,8 @@ static void oledShowServer(const char* bleState, uint8_t conn_count, uint32_t up
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0,0);
-  display.println("SERVER");
+  display.print("SERVER ");
+  display.println(g_is_left_side ? "L" : "R");
   display.print("BLE: ");
   display.print(bleState);
   display.print(" ");
@@ -138,23 +151,34 @@ static void oledShowServer(const char* bleState, uint8_t conn_count, uint32_t up
 static void oledShowClientIdle(uint32_t uptime_s) {
   if (!g_oled_ok) return;
   display.clearDisplay();
-  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1); 
+  display.setTextColor(SSD1306_WHITE);
   display.setCursor(0,0);
-  display.println("CLIENT (IDLE)");
+  display.print("CLIENT ");
+  display.print(g_is_left_side ? "L" : "R");
+  display.println(" (IDLE)");
   display.println("Dock to assign ID");
-  display.print("up: "); display.print(uptime_s); display.println("s");
+  display.print("up: "); 
+  display.print(uptime_s); 
+  display.println("s");
   oledSafeDisplay();
 }
 
 static void oledShowClientBLE(uint32_t id, bool connected, uint32_t uptime_s) {
   if (!g_oled_ok) return;
   display.clearDisplay();
-  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1); 
+  display.setTextColor(SSD1306_WHITE);
   display.setCursor(0,0);
-  display.println("CLIENT (BLE)");
-  display.print("ID: "); display.println((unsigned long)id);
+  display.print("CLIENT ");
+  display.print(g_is_left_side ? "L" : "R");
+  display.println(" (BLE)");
+  display.print("ID: "); 
+  display.println((unsigned long)id);
   display.println(connected ? "State: connected" : "State: advertising");
-  display.print("up: "); display.print(uptime_s); display.println("s");
+  display.print("up: "); 
+  display.print(uptime_s); 
+  display.println("s");
   oledSafeDisplay();
 }
 
@@ -334,7 +358,7 @@ static void oledShowClientsList() {
   oledSafeDisplay();
 }
 
-// ================== USB HID KEYBOARD (SERWER) ==================
+// ===== USB HID KEYBOARD (SERWER) ==================
 uint8_t const desc_hid_report[] = { TUD_HID_REPORT_DESC_KEYBOARD() };
 
 Adafruit_USBD_HID usb_hid(desc_hid_report, sizeof(desc_hid_report),
@@ -400,18 +424,6 @@ uint16_t g_conn = BLE_CONN_HANDLE_INVALID;
 static uint32_t g_active_id = 0;
 static uint8_t  g_active_mac[6] = {0};
 
-// ===== SWITCH (CLIENT) — ISR =====
-volatile bool     g_sw_irq_flag = false;
-volatile uint32_t g_sw_count    = 0;
-volatile uint32_t g_sw_last_us  = 0;
-static void sw_isr() {
-  uint32_t now = micros();
-  if (now - g_sw_last_us < 150000U) return; // ~150 ms debounce
-  g_sw_last_us = now;
-  g_sw_irq_flag = true;
-  g_sw_count++;
-}
-
 // ===== Przycisk listy (SERVER) — ISR =====
 volatile bool     g_btn024_irq     = false;
 volatile uint32_t g_btn024_last_us = 0;
@@ -420,6 +432,16 @@ static void btn024_isr() {
   if (now - g_btn024_last_us < 150000U) return;
   g_btn024_last_us = now;
   g_btn024_irq = true;
+}
+
+// ===== Przycisk wyboru strony (PIN_029) — ISR =====
+volatile bool     g_side_btn_irq     = false;
+volatile uint32_t g_side_btn_last_us = 0;
+static void side_btn_isr() {
+  uint32_t now = micros();
+  if (now - g_side_btn_last_us < 150000U) return; // ~150 ms debounce
+  g_side_btn_last_us = now;
+  g_side_btn_irq = true;
 }
 
 // ===== SERVER CALLBACKS =====
@@ -567,6 +589,93 @@ void server_pollDock_andAssign() {
   }
 }
 
+// ===== helper do wysyłania komendy z clienta =====
+static void client_send_line(const char* line) {
+  if (Bluefruit.connected()) {
+    bleuart.write((const uint8_t*)line, strlen(line));
+    LOGF("[CLIENT] SENT: %s", line);
+
+    if (g_oled_ok) {
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 16);
+      display.println(line);
+      oledSafeDisplay();
+    }
+  } else {
+    LOGF("[CLIENT] (not connected) WOULD SEND: %s", line);
+  }
+}
+
+// ===== wspólny przycisk klawisza na PIN_022 (A/B) =====
+
+static const bool KBD_BTN_ACTIVE_LOW    = true;   // guzik do GND, INPUT_PULLUP
+static const uint32_t KBD_BTN_STABLE_MS = 40;
+
+static bool     kbd_btn_raw_last          = true;
+static uint32_t kbd_btn_raw_change_ms     = 0;
+static bool     kbd_btn_filtered_state    = true;
+static bool     kbd_btn_pressed_logical   = false;
+
+static inline bool kbd_hw_is_pressed(bool raw_level) {
+  return KBD_BTN_ACTIVE_LOW ? (!raw_level) : (raw_level);
+}
+
+static void keyboard_button_poll() {
+  uint32_t now = millis();
+  bool raw_now = digitalRead(KBD_BTN_PIN); // HIGH/LOW z pinu 22
+
+  // detekcja zmiany surowej
+  if (raw_now != kbd_btn_raw_last) {
+    kbd_btn_raw_last      = raw_now;
+    kbd_btn_raw_change_ms = now;
+  }
+
+  // sprawdzamy czy różnica jest stabilna
+  if (raw_now != kbd_btn_filtered_state) {
+    if ((now - kbd_btn_raw_change_ms) >= KBD_BTN_STABLE_MS) {
+      kbd_btn_filtered_state = raw_now;
+      bool pressed_now = kbd_hw_is_pressed(kbd_btn_filtered_state);
+
+      uint8_t keycode   = g_is_left_side ? HID_KEY_A : HID_KEY_B;
+      char    keyLetter = g_is_left_side ? 'A'        : 'B';
+
+      // przejście: released -> pressed
+      if (pressed_now && !kbd_btn_pressed_logical) {
+        kbd_btn_pressed_logical = true;
+        LOGF("[%s] KBD BTN DOWN (%c)",
+             g_is_server ? "SERVER" : "CLIENT",
+             keyLetter);
+
+        if (g_is_server) {
+          // bezpośredni HID do hosta
+          hid_key_down(keycode);
+        } else {
+          // klient wysyła do serwera
+          char line[16];
+          snprintf(line, sizeof(line), "KEY %c DOWN\n", keyLetter);
+          client_send_line(line);
+        }
+      }
+      // przejście: pressed -> released
+      else if (!pressed_now && kbd_btn_pressed_logical) {
+        kbd_btn_pressed_logical = false;
+        LOGF("[%s] KBD BTN UP (%c)",
+             g_is_server ? "SERVER" : "CLIENT",
+             keyLetter);
+
+        if (g_is_server) {
+          hid_key_up_all();
+        } else {
+          char line[16];
+          snprintf(line, sizeof(line), "KEY %c UP\n", keyLetter);
+          client_send_line(line);
+        }
+      }
+    }
+  }
+}
+
 // ===== SERWER most BLE <-> USB LOG + HID =====
 void server_bridgeUsbBle(){
   // host USB -> BLE echo
@@ -582,45 +691,47 @@ void server_bridgeUsbBle(){
   if (g_conn!=BLE_CONN_HANDLE_INVALID && clientUart.available()){
     String s = clientUart.readStringUntil('\n');
 
-    if (s.startsWith("SW ")) {
-      int state = digitalRead(IO_PIN_022);
-      digitalWrite(IO_PIN_022, !state); // TOGGLE LED
-      LOGF("[SERVER] got SWITCH evt from client -> LED on PIN_022 = %s",
-           (!state) ? "ON" : "OFF");
+    if (s.startsWith("KEY ")) {
+      // format: "KEY X DOWN" / "KEY X UP"
+      if (s.length() < 8) {
+        LOGF("[SERVER] malformed KEY cmd: %s", s.c_str());
+      } else {
+        char which = s.charAt(4); // 'A' lub 'B'
+        bool isDown = (s.indexOf("DOWN") >= 0);
+        uint8_t keycode;
 
-      if (g_oled_ok && !g_oled_show_list) {
-        display.setTextSize(1);
-        display.setTextColor(SSD1306_WHITE);
-        display.setCursor(80, (OLED_H >= 64) ? 40 : 24);
-        display.print("LED: ");
-        display.println((!state) ? "ON" : "OFF");
-        oledSafeDisplay();
-      }
-    }
+        if (which == 'A')      keycode = HID_KEY_A;
+        else if (which == 'B') keycode = HID_KEY_B;
+        else {
+          LOGF("[SERVER] unknown KEY: %c", which);
+          return;
+        }
 
-    else if (s.startsWith("KEY A DOWN")) {
-      LOGF("[SERVER] KEY A DOWN -> hold start");
-      hid_key_down(HID_KEY_A); // trzymaj 'a'
+        if (isDown) {
+          LOGF("[SERVER] KEY %c DOWN -> hold start", which);
+          hid_key_down(keycode);
 
-      if (g_oled_ok && !g_oled_show_list) {
-        display.setTextSize(1);
-        display.setTextColor(SSD1306_WHITE);
-        display.setCursor(80, (OLED_H >= 64) ? 40 : 24);
-        display.print("A:DOWN");
-        oledSafeDisplay();
-      }
-    }
+          if (g_oled_ok && !g_oled_show_list) {
+            display.setTextSize(1);
+            display.setTextColor(SSD1306_WHITE);
+            display.setCursor(80, (OLED_H >= 64) ? 40 : 24);
+            display.print(which);
+            display.print(":DOWN");
+            oledSafeDisplay();
+          }
+        } else {
+          LOGF("[SERVER] KEY %c UP -> hold end", which);
+          hid_key_up_all();
 
-    else if (s.startsWith("KEY A UP")) {
-      LOGF("[SERVER] KEY A UP -> hold end");
-      hid_key_up_all(); // puść 'a'
-
-      if (g_oled_ok && !g_oled_show_list) {
-        display.setTextSize(1);
-        display.setTextColor(SSD1306_WHITE);
-        display.setCursor(80, (OLED_H >= 64) ? 40 : 24);
-        display.print("A:UP  ");
-        oledSafeDisplay();
+          if (g_oled_ok && !g_oled_show_list) {
+            display.setTextSize(1);
+            display.setTextColor(SSD1306_WHITE);
+            display.setCursor(80, (OLED_H >= 64) ? 40 : 24);
+            display.print(which);
+            display.print(":UP  ");
+            oledSafeDisplay();
+          }
+        }
       }
     }
 
@@ -635,10 +746,6 @@ void run_server(){
   Bluefruit.begin(0,1);
   Bluefruit.setTxPower(4);
   clientUart.begin();
-
-  // LED na PIN_022 (serwer)
-  pinMode(IO_PIN_022, OUTPUT);
-  digitalWrite(IO_PIN_022, LOW);  // LED OFF
 
   // Przycisk listy (serwer)
   pinMode(BTN_LIST_PIN, INPUT_PULLUP);
@@ -681,6 +788,27 @@ void run_server(){
   bool wasConnected = false;
 
   while (true) {
+    // lokalny przycisk klawisza na PIN_022
+    keyboard_button_poll();
+
+    // zmiana strony klawiatury (LEFT/RIGHT)
+    if (g_side_btn_irq) {
+      noInterrupts(); 
+      g_side_btn_irq = false; 
+      interrupts();
+
+      g_is_left_side = !g_is_left_side;
+      LOGF("[SERVER] keyboard side changed to: %s",
+           g_is_left_side ? "LEFT (A)" : "RIGHT (B)");
+
+      if (g_oled_ok && !g_oled_show_list) {
+        const char* bleStateTxt = (g_conn != BLE_CONN_HANDLE_INVALID)
+                                  ? "connected" : "scanning";
+        uint8_t conn_count = (g_conn != BLE_CONN_HANDLE_INVALID) ? 1 : 0;
+        oledShowServer(bleStateTxt, conn_count, millis()/1000);
+      }
+    }
+
     // toggle trybu wyświetlania listy klientów
     if (g_btn024_irq) {
       noInterrupts(); g_btn024_irq = false; interrupts();
@@ -757,78 +885,8 @@ void run_server(){
 }
 
 // ===== KLIENT =====
-//
-// Zachowanie jak prawdziwy klawisz: wysyłamy DOWN raz przy wciśnięciu,
-// UP raz przy puszczeniu. OS sam robi repeat lub popup akcentów.
-//
-// Mocny debounce: wymagamy stabilnego stanu przez BTN_STABLE_MS
-// zanim uznamy że faktycznie się zmienił. To eliminuje "aa" z drgań.
 
-static const bool BTN_ACTIVE_LOW = true;        // true: guzik do GND, INPUT_PULLUP
-static const uint32_t BTN_STABLE_MS = 40;       // ile ms stan musi być stabilny
-
-static bool     btn_raw_last          = true;   // ostatni surowy stan pinu
-static uint32_t btn_raw_change_ms     = 0;      // kiedy zaobserwowaliśmy zmianę raw
-static bool     btn_filtered_state    = true;   // stan po debounce (HIGH = puść przy INPUT_PULLUP)
-static bool     btn_pressed_logical   = false;  // czy logicznie "jest wciśnięty"
-
-static inline bool hw_is_pressed(bool raw_level) {
-  // przy INPUT_PULLUP: LOW = pressed, HIGH = released
-  return BTN_ACTIVE_LOW ? (!raw_level) : (raw_level);
-}
-
-// helper do wysyłania komendy do serwera
-static void client_send_line(const char* line) {
-  if (Bluefruit.connected()) {
-    bleuart.write((const uint8_t*)line, strlen(line));
-    LOGF("[CLIENT] SENT: %s", line);
-
-    if (g_oled_ok) {
-      display.setTextSize(1);
-      display.setTextColor(SSD1306_WHITE);
-      display.setCursor(0, 16);
-      display.println(line);
-      oledSafeDisplay();
-    }
-  } else {
-    LOGF("[CLIENT] (not connected) WOULD SEND: %s", line);
-  }
-}
-
-void client_poll_button_sendHID() {
-  uint32_t now = millis();
-  bool raw_now = digitalRead(PIN_024); // HIGH/LOW z pinu
-
-  // jeśli surowy stan się zmienił → zapamiętaj kiedy
-  if (raw_now != btn_raw_last) {
-    btn_raw_last = raw_now;
-    btn_raw_change_ms = now;
-  }
-
-  // jeśli surowy stan != przefiltrowany stan,
-  // i ta różnica jest stabilna już >= BTN_STABLE_MS → zaakceptuj
-  if (raw_now != btn_filtered_state) {
-    if ((now - btn_raw_change_ms) >= BTN_STABLE_MS) {
-      // przyjmij nowy stan jako oficjalny
-      btn_filtered_state = raw_now;
-
-      bool pressed_now = hw_is_pressed(btn_filtered_state);
-
-      // przejście: released -> pressed
-      if (pressed_now && !btn_pressed_logical) {
-        btn_pressed_logical = true;
-        LOGF("[CLIENT] BTN DOWN (debounced) at %lu ms", (unsigned long)now);
-        client_send_line("KEY A DOWN\n");
-      }
-      // przejście: pressed -> released
-      else if (!pressed_now && btn_pressed_logical) {
-        btn_pressed_logical = false;
-        LOGF("[CLIENT] BTN UP (debounced) at %lu ms", (unsigned long)now);
-        client_send_line("KEY A UP\n");
-      }
-    }
-  }
-}
+// BOOT-idle/ble i HID przez BLE
 
 void client_startAdvertising(uint32_t id){
   Bluefruit.Advertising.clearData();
@@ -868,13 +926,6 @@ void run_client_idle_or_ble(){
   Bluefruit.setTxPower(4);
   bleuart.begin();
 
-  // SWITCH na PIN_022 (klient) – przycisk do GND
-  pinMode(IO_PIN_022, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(IO_PIN_022), sw_isr, FALLING);
-
-  // Przycisk "A" na PIN_024
-  pinMode(PIN_024, INPUT_PULLUP);
-
   // Heartbeat LED w trybie idle (nieblokująco)
   bool cli_idle_led_state = false;
   uint32_t cli_idle_led_next = millis();
@@ -910,7 +961,20 @@ void run_client_idle_or_ble(){
 
       // już tu reagujemy na przycisk (jak klawisz),
       // ale jeśli nie connected, to tylko log
-      client_poll_button_sendHID();
+      keyboard_button_poll();
+
+      // zmiana strony klawiatury (LEFT/RIGHT)
+      if (g_side_btn_irq) {
+        noInterrupts(); 
+        g_side_btn_irq = false; 
+        interrupts();
+
+        g_is_left_side = !g_is_left_side;
+        LOGF("[CLIENT_IDLE] keyboard side changed to: %s",
+             g_is_left_side ? "LEFT (A)" : "RIGHT (B)");
+
+        if (g_oled_ok) oledShowClientIdle(millis()/1000);
+      }
 
       yield();
     }
@@ -950,34 +1014,24 @@ void run_client_idle_or_ble(){
       }
     }
 
-    // SWITCH na PIN_022 → zgłoś do serwera
-    if (g_sw_irq_flag) {
-      noInterrupts();
-      g_sw_irq_flag = false;
-      uint32_t cnt = g_sw_count;
+    // przycisk litery A/B na PIN_022 → HID DOWN/UP przez BLE
+    keyboard_button_poll();
+
+    // zmiana strony klawiatury (LEFT/RIGHT)
+    if (g_side_btn_irq) {
+      noInterrupts(); 
+      g_side_btn_irq = false; 
       interrupts();
 
-      if (Bluefruit.connected()) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "SW %lu\n", (unsigned long)cnt);
-        bleuart.write((const uint8_t*)buf, strlen(buf));
-        LOGF("[CLIENT] sent SWITCH #%lu to server", (unsigned long)cnt);
+      g_is_left_side = !g_is_left_side;
+      LOGF("[CLIENT] keyboard side changed to: %s",
+           g_is_left_side ? "LEFT (A)" : "RIGHT (B)");
 
-        if (g_oled_ok) {
-          display.setTextSize(1);
-          display.setTextColor(SSD1306_WHITE);
-          display.setCursor(0, (OLED_H >= 64) ? 40 : 24);
-          display.print("BTN cnt: ");
-          display.println((unsigned long)cnt);
-          oledSafeDisplay();
-        }
-      } else {
-        LOGF("[CLIENT] switch press, but not connected – skipped");
+      if (g_oled_ok) {
+        bool isConn = Bluefruit.connected();
+        oledShowClientBLE(g_cfg.client_id, isConn, millis()/1000);
       }
     }
-
-    // przycisk litery 'A' → HID DOWN/UP
-    client_poll_button_sendHID();
 
     // dock reassign?
     if (UART_DOCK.available()){
@@ -1003,10 +1057,19 @@ void setup(){
   // HID najpierw, żeby host widział CDC+HID
   usb_hid.begin();
 
-  pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
+  pinMode(LED_PIN, OUTPUT); 
+  digitalWrite(LED_PIN, LOW);
+
   UART_DOCK.setPins(UART_RX_PIN, UART_TX_PIN);
   UART_DOCK.begin(UART_BAUD);
   USB_LOG.begin(115200);
+
+  // przycisk klawisza na PIN_022 (INPUT_PULLUP)
+  pinMode(KBD_BTN_PIN, INPUT_PULLUP);
+
+  // przycisk wyboru strony na PIN_029 (INPUT_PULLUP + IRQ)
+  pinMode(SIDE_BTN_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(SIDE_BTN_PIN), side_btn_isr, FALLING);
 
   // OLED init
   Wire.begin();
@@ -1022,8 +1085,9 @@ void setup(){
     oledSafeDisplay();
   }
 
-  LOGF("[IO] PIN_022 configured: server=LED (OUTPUT), client=SWITCH (INPUT_PULLUP)");
-  LOGF("[IO] PIN_024 configured: server=BTN (INPUT_PULLUP) / client='A' key button");
+  LOGF("[IO] PIN_022 configured: KBD button (A/B) INPUT_PULLUP on server & client");
+  LOGF("[IO] PIN_024 configured: server=BTN list (INPUT_PULLUP)");
+  LOGF("[IO] PIN_029 configured: LEFT/RIGHT selector button (INPUT_PULLUP)");
 
   // BOOT faza: jeśli USB mounted → serwer, inaczej klient
   uint32_t t0=millis();
@@ -1034,8 +1098,13 @@ void setup(){
   }
   LOGF(usb_mounted() ? "[BOOT] USB mounted" : "[BOOT] USB timeout");
 
-  if (usb_mounted()) run_server();
-  else               run_client_idle_or_ble();
+  if (usb_mounted()) {
+    g_is_server = true;
+    run_server();
+  } else {
+    g_is_server = false;
+    run_client_idle_or_ble();
+  }
 }
 
 void loop(){}
