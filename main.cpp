@@ -60,6 +60,15 @@ extern "C" {
   #define OLED_H 32   // zmień na 64 jeśli masz 128x64
 #endif
 
+// ===== BATTERY SENSE =====
+#ifndef BAT_CHG_PIN
+  #define BAT_CHG_PIN PIN_004   // np. 4 / 31 itd. Dostosuj do swojego układu
+#endif
+
+// Przybliżone napięcia dla 1S LiPo (dostosuj do swojej baterii)
+#define BATT_MIN_V 3.30f   // napięcie ~0%
+#define BATT_MAX_V 4.20f   // napięcie ~100%
+
 Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, -1);
 static bool g_oled_ok = false;
 
@@ -69,6 +78,15 @@ static bool g_oled_show_list = false;
 // —— wybór strony klawiatury ——
 static bool g_is_left_side = true;   // true = LEFT => 'A', false = RIGHT => 'B'
 static bool g_is_server    = false;  // ustawiane w setup()
+
+// ===== STAN BATERII =====
+static float   g_battVoltage  = 0.0f;
+static uint8_t g_battPercent  = 0;
+static bool    g_battCharging = false;
+
+// filtrowanie napięcia
+static bool  g_battFiltInit    = false;
+static float g_battVoltageFilt = 0.0f;
 
 // ===== FLASH CONFIG KLIENTA =====
 struct ClientConfig { uint32_t magic; uint32_t client_id; };
@@ -127,8 +145,207 @@ static inline int getRealRssi(uint16_t conn_handle) {
   return INT16_MIN; // brak danych
 }
 
+// ===== ODCZYT NAPIĘCIA BATERII (nRF52 SAADC, VDDH/5) =====
+// — przeliczenie dokładnie jak w Twoim przykładzie —
+float readBatteryVoltage() {
+  volatile uint32_t raw_value = 0;
+
+  // Configure SAADC
+  NRF_SAADC->ENABLE = 1;
+  NRF_SAADC->RESOLUTION = SAADC_RESOLUTION_VAL_12bit;
+
+  NRF_SAADC->CH[0].CONFIG =
+    (SAADC_CH_CONFIG_GAIN_Gain1_4 << SAADC_CH_CONFIG_GAIN_Pos) |
+    (SAADC_CH_CONFIG_MODE_SE      << SAADC_CH_CONFIG_MODE_Pos) |
+    (SAADC_CH_CONFIG_REFSEL_Internal << SAADC_CH_CONFIG_REFSEL_Pos);
+
+  NRF_SAADC->CH[0].PSELP = SAADC_CH_PSELP_PSELP_VDDHDIV5;
+  NRF_SAADC->CH[0].PSELN = SAADC_CH_PSELN_PSELN_NC;
+
+  // Single sample
+  NRF_SAADC->RESULT.PTR    = (uint32_t)&raw_value;
+  NRF_SAADC->RESULT.MAXCNT = 1;
+  NRF_SAADC->TASKS_START   = 1;
+  while (!NRF_SAADC->EVENTS_STARTED);
+  NRF_SAADC->EVENTS_STARTED = 0;
+  NRF_SAADC->TASKS_SAMPLE   = 1;
+  while (!NRF_SAADC->EVENTS_END);
+  NRF_SAADC->EVENTS_END   = 0;
+  NRF_SAADC->TASKS_STOP   = 1;
+  while (!NRF_SAADC->EVENTS_STOPPED);
+  NRF_SAADC->EVENTS_STOPPED = 0;
+  NRF_SAADC->ENABLE = 0;
+
+  // Force explicit double-precision calculations
+  double raw_double = (double)raw_value;
+  double step1 = raw_double * 2.4;     // referencja 2.4V
+  double step2 = step1 / 4095.0;       // 12-bit
+  double vddh  = 5.0 * step2;          // VDDH = 5 * VDDHDIV5
+
+  return (float)vddh;
+}
+
+// Przeliczenie napięcia baterii na % (całkowite)
+
+
+// Dokładny procent jako float (przed zaokrągleniem) – do histerezy
+static inline float batteryVoltageToPercent(float v) {
+  if (v <= BATT_MIN_V) return 0.f;
+  if (v >= BATT_MAX_V) return 100.f;
+  return (v - BATT_MIN_V) * 100.f / (BATT_MAX_V - BATT_MIN_V);
+}
+
+// Jedno miejsce gdzie odświeżamy globalne zmienne baterii
+// + filtr + wykrywanie ładowania, żeby wartości nie skakały
+static void updateBatteryStatus() {
+  float vRaw = readBatteryVoltage();
+  uint32_t now = millis();
+
+  // — stan wewnętrzny
+  static bool first_run = true;
+
+  // Debounce ładowania (LOW na BAT_CHG_PIN = ładuje)
+  static bool     chg_state = false;      // zaakceptowany stan
+  static bool     chg_pending = false;
+  static uint32_t chg_change_ms = 0;
+  const  uint16_t CHG_DEBOUNCE_MS = 500;
+
+  // Okno „fast” po starcie / zmianie ładowania (szybkie osiadanie)
+  static uint32_t fast_until_ms = 0;
+
+  // Histereza dla procenta (Schmitt)
+  static uint8_t pStable = 0;             // stabilny, wyświetlany %
+  static bool    pInit   = false;
+  const  float   H = 1.2f;                // szerokość martwej strefy (±1.2%)
+
+  // — 1) szybki start — natychmiastowy, dokładny %
+  if (first_run) {
+    float vClamped = (vRaw > BATT_MAX_V) ? BATT_MAX_V : vRaw;
+    g_battVoltageFilt = vRaw;
+    g_battVoltage     = vRaw;
+    g_battFiltInit    = true;
+    pStable           = (uint8_t)roundf(batteryVoltageToPercent(vClamped));
+    pInit             = true;
+    g_battPercent     = pStable;          // OD RAZU na starcie
+    first_run         = false;
+    fast_until_ms     = now + 1500;       // krótki boost po starcie
+  }
+
+  // — 2) stabilna detekcja ładowania (pin lub pik napięcia)
+  bool pinCharging = false;
+  if (BAT_CHG_PIN >= 0) pinCharging = (digitalRead(BAT_CHG_PIN) == LOW);
+  bool vSuggestsCharging = (vRaw > (BATT_MAX_V + 0.05f));
+  bool chg_raw = pinCharging || vSuggestsCharging;
+
+  if (chg_raw != chg_pending) { chg_pending = chg_raw; chg_change_ms = now; }
+  bool prev_chg_state = chg_state;
+  if ((now - chg_change_ms) >= CHG_DEBOUNCE_MS) chg_state = chg_pending;
+  g_battCharging = chg_state;
+
+  // — 3) zbocze stanu ładowania → natychmiastowy „snap” + okno fast
+  if (chg_state != prev_chg_state) {
+    g_battVoltageFilt = vRaw;
+    g_battVoltage     = vRaw;
+    uint8_t pctNow    = (uint8_t)roundf(batteryVoltageToPercent((vRaw > BATT_MAX_V) ? BATT_MAX_V : vRaw));
+    pStable           = pctNow;           // od razu prawda także W TRAKCIE ładowania
+    g_battPercent     = pStable;
+    fast_until_ms     = now + 2000;       // 2 s szybkiego osiadania
+  }
+
+  // — 4) filtr EMA adaptacyjny: duży skok → szybciej
+  float dv    = fabsf(vRaw - g_battVoltageFilt);
+  bool  big   = (dv > 0.06f);             // ~60 mV
+  float alpha = ((now < fast_until_ms) || big) ? 0.80f : 0.12f;
+  g_battVoltageFilt = g_battVoltageFilt + alpha * (vRaw - g_battVoltageFilt);
+  g_battVoltage     = g_battVoltageFilt;
+
+  // — 5) procent (float), clamp do MAX żeby nie wskakiwało sztuczne 100%
+  float  vForPct = (g_battVoltageFilt > BATT_MAX_V) ? BATT_MAX_V : g_battVoltageFilt;
+  float  pFloat  = batteryVoltageToPercent(vForPct);
+
+  // — 6) histereza Schmitta ±1.2% (DZIAŁA ZAWSZE — także gdy ładuje)
+  if (!pInit) { pStable = (uint8_t)roundf(pFloat); pInit = true; }
+
+  if (now < fast_until_ms) {
+    // w trybie fast aktualizuj natychmiast (po starcie / zmianie CHG)
+    pStable = (uint8_t)roundf(pFloat);
+  } else {
+    // poza fast: zmiana o 1 pp dopiero po wyjściu poza martwą strefę
+    float upTh   = (float)pStable + H;
+    float downTh = (float)pStable - H;
+    if (pFloat >= upTh  && pStable < 100) pStable++;      // rośnij o 1
+    else if (pFloat <= downTh && pStable > 0)  pStable--; // malej o 1
+    // w środku martwej strefy nic — brak ping-pongu
+  }
+
+  g_battPercent = pStable;  // AKTUALIZUJEMY TAKŻE PODCZAS ŁADOWANIA
+}
+
 // ===== OLED helpers =====
 static inline void oledSafeDisplay() { if (g_oled_ok) display.display(); }
+
+// Rysowanie ikonki baterii w prawym górnym rogu
+static void drawBatteryIcon() {
+  if (!g_oled_ok) return;
+
+  const int iconW = 16;
+  const int iconH = 8;
+  int x = OLED_W - iconW - 1;
+  int y = 0;
+
+  // Ramka baterii
+  display.drawRect(x, y, iconW-2, iconH, SSD1306_WHITE);
+  // "czubek"
+  display.drawRect(x + iconW - 3, y + 2, 2, iconH-4, SSD1306_WHITE);
+
+  // Wypełnienie wnętrza zależnie od % (bez ramek) – tylko gdy NIE ładuje
+  int innerW = iconW - 4;
+  int innerH = iconH - 2;
+  int fillW  = (int)((innerW * g_battPercent) / 100);
+
+  if (fillW < 0) fillW = 0;
+  if (fillW > innerW) fillW = innerW;
+
+  if (!g_battCharging && fillW > 0) {
+    display.fillRect(x + 2, y + 1, fillW, innerH, SSD1306_WHITE);
+  }
+
+  // Tekst małym fontem obok ikonki
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(x - 28, y);
+
+  if (g_battCharging) {
+    display.print("CHG");
+  } else {
+    display.print(g_battPercent);
+    display.print("%");
+  }
+
+  // Błyskawica przy ładowaniu
+  if (g_battCharging) {
+    int bx = x + 3;   // przesunięcie wewnątrz baterii
+    int by = y + 1;
+
+    const uint8_t boltW = 8;
+    const uint8_t boltH = 5;
+    const uint8_t bolt[boltH][boltW] = {
+      {0,1,1,0,0,0,0,0},
+      {1,1,1,0,0,0,0,0},
+      {0,0,1,1,1,0,0,0},
+      {0,0,0,1,1,1,0,0},
+      {0,0,0,0,1,1,0,0}
+    };
+
+    for (uint8_t ry = 0; ry < boltH; ry++) {
+      for (uint8_t rx = 0; rx < boltW; rx++) {
+        if (bolt[ry][rx]) {
+          display.drawPixel(bx + rx, by + ry, SSD1306_WHITE);
+        }
+      }
+    }
+  }
+}
 
 static void oledShowServer(const char* bleState, uint8_t conn_count, uint32_t uptime_s) {
   if (!g_oled_ok) return;
@@ -145,6 +362,8 @@ static void oledShowServer(const char* bleState, uint8_t conn_count, uint32_t up
   display.print("up: ");
   display.print(uptime_s);
   display.println("s");
+
+  drawBatteryIcon();
   oledSafeDisplay();
 }
 
@@ -156,11 +375,13 @@ static void oledShowClientIdle(uint32_t uptime_s) {
   display.setCursor(0,0);
   display.print("CLIENT ");
   display.print(g_is_left_side ? "L" : "R");
-  display.println(" (IDLE)");
+  display.println(" ");
   display.println("Dock to assign ID");
   display.print("up: "); 
   display.print(uptime_s); 
   display.println("s");
+
+  drawBatteryIcon();
   oledSafeDisplay();
 }
 
@@ -179,6 +400,8 @@ static void oledShowClientBLE(uint32_t id, bool connected, uint32_t uptime_s) {
   display.print("up: "); 
   display.print(uptime_s); 
   display.println("s");
+
+  drawBatteryIcon();
   oledSafeDisplay();
 }
 
@@ -355,6 +578,7 @@ static void oledShowClientsList() {
     display.println((unsigned long)g_ids_count);
   }
 
+  drawBatteryIcon();
   oledSafeDisplay();
 }
 
@@ -600,6 +824,7 @@ static void client_send_line(const char* line) {
       display.setTextColor(SSD1306_WHITE);
       display.setCursor(0, 16);
       display.println(line);
+      drawBatteryIcon();
       oledSafeDisplay();
     }
   } else {
@@ -608,7 +833,6 @@ static void client_send_line(const char* line) {
 }
 
 // ===== wspólny przycisk klawisza na PIN_022 (A/B) =====
-
 static const bool KBD_BTN_ACTIVE_LOW    = true;   // guzik do GND, INPUT_PULLUP
 static const uint32_t KBD_BTN_STABLE_MS = 40;
 
@@ -717,6 +941,7 @@ void server_bridgeUsbBle(){
             display.setCursor(80, (OLED_H >= 64) ? 40 : 24);
             display.print(which);
             display.print(":DOWN");
+            drawBatteryIcon();
             oledSafeDisplay();
           }
         } else {
@@ -729,6 +954,7 @@ void server_bridgeUsbBle(){
             display.setCursor(80, (OLED_H >= 64) ? 40 : 24);
             display.print(which);
             display.print(":UP  ");
+            drawBatteryIcon();
             oledSafeDisplay();
           }
         }
@@ -788,6 +1014,20 @@ void run_server(){
   bool wasConnected = false;
 
   while (true) {
+
+    // ---- AUTO-SWITCH: jeśli USB zniknie → reboot jako CLIENT ----
+    static uint32_t usb_unplug_since = 0;
+    if (!usb_mounted()) {
+      if (usb_unplug_since == 0) usb_unplug_since = millis();   // start licznika
+      if (millis() - usb_unplug_since > 800) {                   // debounce ~0.8 s
+        LOGF("[SERVER] USB unplugged → reboot to CLIENT");
+        delay(50);
+        soft_reset();                                            // NVIC_SystemReset()
+      }
+    } else {
+      usb_unplug_since = 0; // nadal podłączone – zeruj licznik
+    }
+
     // lokalny przycisk klawisza na PIN_022
     keyboard_button_poll();
 
@@ -842,12 +1082,18 @@ void run_server(){
       last = millis();
       char clients[512]; format_clients_inline(clients, sizeof(clients));
 
+      // odświeżenie stanu baterii
+      updateBatteryStatus();
+
       const char* bleStateTxt = (g_conn != BLE_CONN_HANDLE_INVALID)
                                 ? "connected" : "scanning";
       uint8_t conn_count = (g_conn != BLE_CONN_HANDLE_INVALID) ? 1 : 0;
 
-      LOGF("[SERVER] uptime=%lus BLE=%s | clients: %s",
-           millis()/1000, bleStateTxt, clients);
+      LOGF("[SERVER] uptime=%lus BLE=%s | batt=%.2fV (%u%%)%s | clients: %s",
+           millis()/1000, bleStateTxt,
+           g_battVoltage, g_battPercent,
+           g_battCharging ? " [CHG]" : "",
+           clients);
 
       if (g_oled_ok && !g_oled_show_list) {
         oledShowServer(bleStateTxt, conn_count, millis()/1000);
@@ -883,7 +1129,6 @@ void run_server(){
     yield();
   }
 }
-
 // ===== KLIENT =====
 
 // BOOT-idle/ble i HID przez BLE
@@ -936,12 +1181,25 @@ void run_client_idle_or_ble(){
     LOGF("[BOOT] role=CLIENT_IDLE (no ID)");
     if (g_oled_ok) oledShowClientIdle(millis()/1000);
 
+    uint32_t last_idle_oled_ms = 0;
+
     while(true){
       uint32_t now = millis();
+
+      // heartbeat LED
       if (now >= cli_idle_led_next) {
         cli_idle_led_state = !cli_idle_led_state;
         digitalWrite(LED_PIN, cli_idle_led_state ? HIGH : LOW);
         cli_idle_led_next = now + (cli_idle_led_state ? CLI_IDLE_ON_MS : CLI_IDLE_OFF_MS);
+      }
+
+      // odświeżanie OLED
+      if (now - last_idle_oled_ms > 1000) {
+        last_idle_oled_ms = now;
+
+        updateBatteryStatus();
+
+        if (g_oled_ok) oledShowClientIdle(now/1000);
       }
 
       if (usb_mounted()){
@@ -959,11 +1217,10 @@ void run_client_idle_or_ble(){
         break;
       }
 
-      // już tu reagujemy na przycisk (jak klawisz),
-      // ale jeśli nie connected, to tylko log
+      // przycisk
       keyboard_button_poll();
 
-      // zmiana strony klawiatury (LEFT/RIGHT)
+      // zmiana strony klawiatury
       if (g_side_btn_irq) {
         noInterrupts(); 
         g_side_btn_irq = false; 
@@ -973,7 +1230,8 @@ void run_client_idle_or_ble(){
         LOGF("[CLIENT_IDLE] keyboard side changed to: %s",
              g_is_left_side ? "LEFT (A)" : "RIGHT (B)");
 
-        if (g_oled_ok) oledShowClientIdle(millis()/1000);
+        updateBatteryStatus();
+        if (g_oled_ok) oledShowClientIdle(now/1000);
       }
 
       yield();
@@ -995,17 +1253,22 @@ void run_client_idle_or_ble(){
     if (millis()-last>1000){
       last=millis();
       bool isConn = Bluefruit.connected();
-      LOGF("[CLIENT] uptime=%lus BLE=%s ID=%lu",
+
+      updateBatteryStatus();
+
+      LOGF("[CLIENT] uptime=%lus BLE=%s ID=%lu | batt=%.2fV (%u%%)%s",
            millis()/1000,
            isConn ? "connected" : "advertising",
-           g_cfg.client_id);
+           g_cfg.client_id,
+           g_battVoltage, g_battPercent,
+           g_battCharging ? " [CHG]" : "");
 
       if (g_oled_ok) {
         oledShowClientBLE(g_cfg.client_id, isConn, millis()/1000);
       }
     }
 
-    // jeśli połączenie BLE aktywne, echo danych itp.
+    // echo przez BLE
     if (Bluefruit.connected()){
       digitalWrite(LED_PIN,HIGH);
       while (bleuart.available()){
@@ -1014,10 +1277,10 @@ void run_client_idle_or_ble(){
       }
     }
 
-    // przycisk litery A/B na PIN_022 → HID DOWN/UP przez BLE
+    // przycisk litery A/B
     keyboard_button_poll();
 
-    // zmiana strony klawiatury (LEFT/RIGHT)
+    // zmiana strony klawiatury
     if (g_side_btn_irq) {
       noInterrupts(); 
       g_side_btn_irq = false; 
@@ -1071,6 +1334,11 @@ void setup(){
   pinMode(SIDE_BTN_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(SIDE_BTN_PIN), side_btn_isr, FALLING);
 
+  // pin ładowania baterii (jeśli używany)
+  if (BAT_CHG_PIN >= 0) {
+    pinMode(BAT_CHG_PIN, INPUT_PULLUP);  // w razie potrzeby zmień na INPUT
+  }
+
   // OLED init
   Wire.begin();
   g_oled_ok = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
@@ -1082,6 +1350,9 @@ void setup(){
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0,0);
     display.println("Display OK");
+    // pierwszy odczyt baterii — natychmiastowe % dzięki nowej funkcji
+    updateBatteryStatus();
+    drawBatteryIcon();
     oledSafeDisplay();
   }
 
