@@ -84,7 +84,11 @@ static bool    g_battCharging = false;
 
 static bool  g_battFiltInit    = false;
 static float g_battVoltageFilt = 0.0f;
-
+// animacja baterii podczas ładowania
+static uint8_t  g_chargeAnimLevel     = 0;      // 0..100
+static uint32_t g_chargeAnimLastMs    = 0;
+static const    uint16_t g_chargeAnimStepMs = 500; // co ile ms zmieniać poziom
+static const    uint8_t  g_chargeAnimStep   = 20;   // o ile % rośnie
 // ===== CLIENT GLOBAL ID (tylko EEPROM) =====
 static uint32_t g_client_id = 0;
 
@@ -441,52 +445,49 @@ static void drawBatteryIcon() {
   int x = OLED_W - iconW - 1;
   int y = 0;
 
+  // obrys
   display.drawRect(x, y, iconW-2, iconH, SSD1306_WHITE);
   display.drawRect(x + iconW - 3, y + 2, 2, iconH-4, SSD1306_WHITE);
 
   int innerW = iconW - 4;
   int innerH = iconH - 2;
-  int fillW  = (int)((innerW * g_battPercent) / 100);
 
+  // --- WYLICZENIE WYPEŁNIENIA ---
+  uint8_t levelForFill = g_battPercent;
+
+  if (g_battCharging) {
+    // podczas ładowania ignorujemy realny % i robimy animację 0→100→0...
+    uint32_t now = millis();
+    if (now - g_chargeAnimLastMs >= g_chargeAnimStepMs) {
+      g_chargeAnimLastMs = now;
+      if (g_chargeAnimLevel + g_chargeAnimStep >= 100) {
+        g_chargeAnimLevel = 0;
+      } else {
+        g_chargeAnimLevel += g_chargeAnimStep;
+      }
+    }
+    levelForFill = g_chargeAnimLevel;
+  }
+
+  int fillW  = (int)((innerW * levelForFill) / 100);
   if (fillW < 0) fillW = 0;
   if (fillW > innerW) fillW = innerW;
 
-  if (!g_battCharging && fillW > 0) {
+  if (fillW > 0) {
     display.fillRect(x + 2, y + 1, fillW, innerH, SSD1306_WHITE);
   }
 
+  // --- NAPIS obok baterii ---
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(x - 28, y);
 
   if (g_battCharging) {
+    // w trakcie ładowania wyświetlamy "CHG" + ew. % / anim
     display.print("CHG");
   } else {
     display.print(g_battPercent);
     display.print("%");
-  }
-
-  if (g_battCharging) {
-    int bx = x + 3;
-    int by = y + 1;
-
-    const uint8_t boltW = 8;
-    const uint8_t boltH = 5;
-    const uint8_t bolt[boltH][boltW] = {
-      {0,1,1,0,0,0,0,0},
-      {1,1,1,0,0,0,0,0},
-      {0,0,1,1,1,0,0,0},
-      {0,0,0,1,1,1,0,0},
-      {0,0,0,0,1,1,0,0}
-    };
-
-    for (uint8_t ry = 0; ry < boltH; ry++) {
-      for (uint8_t rx = 0; rx < boltW; rx++) {
-        if (bolt[ry][rx]) {
-          display.drawPixel(bx + rx, by + ry, SSD1306_WHITE);
-        }
-      }
-    }
   }
 }
 
@@ -1286,13 +1287,18 @@ void run_server(){
       uint8_t conn_count = (g_conn != BLE_CONN_HANDLE_INVALID) ? 1 : 0;
 
       LOGF("[SERVER] uptime=%lus BLE=%s | batt=%.2fV (%u%%)%s | clients: %s",
-           millis()/1000, bleStateTxt,
-           g_battVoltage, g_battPercent,
-           g_battCharging ? " [CHG]" : "",
-           clients);
+          millis()/1000, bleStateTxt,
+          g_battVoltage, g_battPercent,
+          g_battCharging ? " [CHG]" : "",
+          clients);
 
-      if (g_oled_ok && !g_oled_show_list) {
-        oledShowServer(bleStateTxt, conn_count, millis()/1000);
+      if (g_oled_ok) {
+        if (g_oled_show_list) {
+          // odświeżaj ekran z listą – bateria też się narysuje Z ANIMACJĄ
+          oledShowClientsList();
+        } else {
+          oledShowServer(bleStateTxt, conn_count, millis()/1000);
+        }
       }
     }
 
