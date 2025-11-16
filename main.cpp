@@ -25,7 +25,7 @@ extern "C" {
 #define KBD_BTN_PIN PIN_022
 
 #ifndef PIN_024
-#define PIN_024 (24)     // serwer: przycisk listy
+#define PIN_024 (24)     // przycisk listy (tylko server)
 #endif
 #define BTN_LIST_PIN PIN_024
 
@@ -33,6 +33,12 @@ extern "C" {
 #define PIN_029 (29)     // przycisk wyboru strony klawiatury (LEFT/RIGHT)
 #endif
 #define SIDE_BTN_PIN PIN_029
+
+// *** NOWE: PIN RESETU FABRYCZNEGO ***
+#ifndef PIN_010
+#define PIN_010 (10)
+#endif
+#define RESET_BTN_PIN PIN_010
 
 #define USB_LOG   Serial
 #define UART_DOCK Serial1
@@ -736,6 +742,40 @@ static void oledShowClientsList() {
   oledSafeDisplay();
 }
 
+// ===== FACTORY RESET =====
+
+// wyczyszczenie bazy klientów po stronie SERWERA
+static void eeprom_wipe_server_db() {
+  LOGF("[RESET] wiping SERVER DB in EEPROM...");
+  eeprom_write_u32(EEPROM_ADDR_SERVER_MAGIC, 0);
+  eeprom_write_u32(EEPROM_ADDR_SERVER_COUNT, 0);
+  g_ids_count = 0;
+}
+
+// wyczyszczenie ID klienta po stronie KLIENTA
+static void eeprom_wipe_client_id() {
+  LOGF("[RESET] wiping CLIENT ID in EEPROM...");
+  eeprom_write_byte(EEPROM_ADDR_CLIENT_FLAG, 0x00);
+  eeprom_write_u32(EEPROM_ADDR_CLIENT_ID, 0);
+  g_client_id = 0;
+}
+
+// wspólna obsługa przycisku resetu – wersja dla serwera
+static void factory_reset_server() {
+  LOGF("[RESET] FACTORY RESET (SERVER) – clearing DB and rebooting...");
+  eeprom_wipe_server_db();
+  delay(50);
+  soft_reset();
+}
+
+// wspólna obsługa przycisku resetu – wersja dla klienta
+static void factory_reset_client() {
+  LOGF("[RESET] FACTORY RESET (CLIENT) – clearing ID and rebooting...");
+  eeprom_wipe_client_id();
+  delay(50);
+  soft_reset();
+}
+
 // ===== USB HID KEYBOARD (SERWER) ==================
 uint8_t const desc_hid_report[] = { TUD_HID_REPORT_DESC_KEYBOARD() };
 
@@ -882,24 +922,41 @@ void server_disconnect_cb(uint16_t, uint8_t reason) {
   }
 }
 
-// ===== SERVER SCAN CB =====
+// ===== SERVER SCAN CB (z whitelistą po MAC) =====
 void server_scan_cb(ble_gap_evt_adv_report_t* report){
+  const uint8_t* mac = report->peer_addr.addr;
+
+  int idx = idx_by_mac(mac);
+  if (idx < 0) {
+    char macStr[18];
+    sprintf(macStr,"%02X:%02X:%02X:%02X:%02X:%02X",
+            mac[5],mac[4],mac[3],mac[2],mac[1],mac[0]);
+    LOGF("[SERVER] ADV from unknown MAC=%s -> ignore", macStr);
+
+    Bluefruit.Scanner.resume();       // <<< DODAJ TO
+    return;
+  }
+
   if (Bluefruit.Scanner.checkReportForService(report, clientUart)) {
     Bluefruit.Scanner.stop();
     Bluefruit.Central.connect(report);
     return;
   }
+
   char name[32] = {0};
   if (adv_get_name(report, name, sizeof(name))) {
     if (strncmp(name, "Client-", 7) == 0) {
-      LOGF("[SERVER] found by name: %s -> connecting", name);
+      LOGF("[SERVER] found known client by name: %s -> connecting", name);
       Bluefruit.Scanner.stop();
       Bluefruit.Central.connect(report);
       return;
     } else {
-      LOGF("[SERVER] seen ADV: %s", name);
+      LOGF("[SERVER] seen ADV (known MAC) name=%s", name);
     }
   }
+
+  // znany MAC, ale nie pasuje UUID ani nazwa → dalej skanuj
+  Bluefruit.Scanner.resume();         // <<< I TU TEŻ MUSI BYĆ
 }
 
 // ===== SERVER UART HELPERY (HELLO/ASSIGN/ACK) =====
@@ -1154,6 +1211,11 @@ void run_server(){
 
   while (true) {
 
+    // FACTORY RESET (SERVER) – przycisk na PIN_010
+    if (digitalRead(RESET_BTN_PIN) == LOW) {
+      factory_reset_server();
+    }
+
     static uint32_t usb_unplug_since = 0;
     if (!usb_mounted()) {
       if (usb_unplug_since == 0) usb_unplug_since = millis();
@@ -1321,6 +1383,11 @@ void run_client_idle_or_ble(){
     while(true){
       uint32_t now = millis();
 
+      // FACTORY RESET (CLIENT) – również w idle
+      if (digitalRead(RESET_BTN_PIN) == LOW) {
+        factory_reset_client();
+      }
+
       if (now >= cli_idle_led_next) {
         cli_idle_led_state = !cli_idle_led_state;
         digitalWrite(LED_PIN, cli_idle_led_state ? HIGH : LOW);
@@ -1377,6 +1444,12 @@ void run_client_idle_or_ble(){
 
   unsigned long last=0;
   while(true){
+
+    // FACTORY RESET (CLIENT) – w trybie BLE
+    if (digitalRead(RESET_BTN_PIN) == LOW) {
+      factory_reset_client();
+    }
+
     if (usb_mounted()){
       LOGF("[CLIENT] USB mounted -> reset");
       soft_reset();
@@ -1465,6 +1538,9 @@ void setup(){
     pinMode(BAT_CHG_PIN, INPUT_PULLUP);
   }
 
+  // PIN resetu fabrycznego
+  pinMode(RESET_BTN_PIN, INPUT_PULLUP);
+
   Wire.begin();
 
   // wczytaj stronę klawiatury z EEPROM – wspólne dla serwera/klienta
@@ -1487,6 +1563,7 @@ void setup(){
   LOGF("[IO] PIN_022: KBD button (A/B) INPUT_PULLUP");
   LOGF("[IO] PIN_024: server BTN list INPUT_PULLUP");
   LOGF("[IO] PIN_029: LEFT/RIGHT selector INPUT_PULLUP");
+  LOGF("[IO] PIN_010: FACTORY RESET button INPUT_PULLUP");
 
   uint32_t t0=millis();
   while(!usb_mounted() && millis()-t0<6000){
